@@ -1,0 +1,16 @@
+# Data files
+*.csv
+
+# Model checkpoints
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
