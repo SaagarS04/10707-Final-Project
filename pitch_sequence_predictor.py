@@ -25,6 +25,9 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
 from collections import Counter
+from ddpm import GaussianDiffusion1D, Unet1D
+
+from tqdm import tqdm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -222,20 +225,22 @@ class PitchSequenceTransfusion(nn.Module):
             nn.Linear(d_model, n_at_bat_events),
         )
 
-        # Continuous heads (Gaussian NLL — Transfusion's diffusion component simplified)
-        self.continuous_mean_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, n_continuous),
+        # Continuous head: DDPM (diffusion model) conditioned on transformer latent
+        self.ddpm_unet = Unet1D(
+            dim=d_model,                # transformer output dim
+            channels=n_continuous,      # number of continuous features
+            dim_mults=(1, 2, 4),        # can be tuned
+            self_condition=False,
+            cond_dim=d_model,           # conditioning from transformer latent
         )
-        self.continuous_logvar_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, n_continuous),
+        self.ddpm = GaussianDiffusion1D(
+            model=self.ddpm_unet,
+            seq_length=max_seq_len,
+            timesteps=1000,
+            sampling_timesteps=20,      # DDIM fast sampling for inference
+            loss_type='l2',
+            objective='pred_noise',
+            beta_schedule='cosine',
         )
 
         self._init_weights()
@@ -263,7 +268,7 @@ class PitchSequenceTransfusion(nn.Module):
             prev_continuous:   (batch, seq_len, n_continuous) — previous continuous pitch attrs
 
         Returns:
-            dict with logits and distributional params for all output heads
+            dict with logits for discrete heads and latent for continuous DDPM
         """
         B, S = prev_pitch_type.shape
 
@@ -292,8 +297,7 @@ class PitchSequenceTransfusion(nn.Module):
             'zone_logits':         self.zone_head(x),
             'pitch_result_logits': self.pitch_result_head(x),
             'at_bat_event_logits': self.at_bat_event_head(x),
-            'continuous_mean':     self.continuous_mean_head(x),
-            'continuous_logvar':   torch.clamp(self.continuous_logvar_head(x), min=-10, max=2),
+            'continuous_latent':   x,  # for DDPM
         }
 
 
@@ -498,7 +502,7 @@ def collate_at_bats(batch):
 # Loss: Transfusion = LM (discrete) + λ · Diffusion/NLL (continuous)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def transfusion_loss(outputs, batch, lambda_continuous=5.0):
+def transfusion_loss(model, outputs, batch, lambda_continuous=5.0):
     """
     Combined loss from Equation 4 of the Transfusion paper:
         L = L_LM + λ · L_DDPM
@@ -539,16 +543,23 @@ def transfusion_loss(outputs, batch, lambda_continuous=5.0):
 
     lm_loss = pt_loss + z_loss + pr_loss + ev_loss
 
-    # ── Continuous loss (Gaussian NLL) ──
-    mean = outputs['continuous_mean']      # (B, S, n_cont)
-    logvar = outputs['continuous_logvar']   # (B, S, n_cont)
-    target = batch['tgt_continuous']        # (B, S, n_cont)
-    var = torch.exp(logvar)
-    nll = 0.5 * (logvar + (target - mean) ** 2 / var)  # (B, S, n_cont)
-    nll = nll.mean(dim=-1)  # average over features → (B, S)
-    nll_loss = (nll * mask).sum() / mask.sum()
-
-    total = lm_loss + lambda_continuous * nll_loss
+    # ── Continuous loss (DDPM) ──
+    # x_start: (B, S, n_continuous) → (B, n_continuous, S)
+    x_start = batch['tgt_continuous'].permute(0, 2, 1)
+    latent = outputs['continuous_latent'].permute(0, 2, 1)
+    seq_length = model.ddpm.seq_length
+    B, n_cont, S = x_start.shape
+    # Pad or truncate to seq_length
+    if S < seq_length:
+        pad_amt = seq_length - S
+        x_start = F.pad(x_start, (0, pad_amt))
+        latent = F.pad(latent, (0, pad_amt))
+    elif S > seq_length:
+        x_start = x_start[:, :, :seq_length]
+        latent = latent[:, :, :seq_length]
+    # Call DDPM forward (returns loss)
+    ddpm_loss = model.ddpm(x_start, cond=latent)
+    total = lm_loss + lambda_continuous * ddpm_loss
 
     return {
         'total': total,
@@ -557,7 +568,7 @@ def transfusion_loss(outputs, batch, lambda_continuous=5.0):
         'zone_loss': z_loss,
         'pr_loss': pr_loss,
         'ev_loss': ev_loss,
-        'nll_loss': nll_loss,
+        'ddpm_loss': ddpm_loss,
     }
 
 
@@ -578,17 +589,17 @@ def train_model(model, train_dataset, val_dataset, epochs=30, batch_size=128, lr
                             collate_fn=collate_at_bats, num_workers=0)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.9, patience = 2)
 
     best_val_loss = float('inf')
     best_state = None
 
     for epoch in range(epochs):
         model.train()
-        train_losses = {k: 0.0 for k in ['total', 'lm_loss', 'nll_loss', 'pt_loss', 'pr_loss', 'ev_loss']}
+        train_losses = {k: 0.0 for k in ['total', 'lm_loss', 'pt_loss', 'pr_loss', 'ev_loss']}
         n_batches = 0
 
-        for batch in train_loader:
+        for batch in tqdm(train_loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
             optimizer.zero_grad()
@@ -597,7 +608,7 @@ def train_model(model, train_dataset, val_dataset, epochs=30, batch_size=128, lr
                 batch['prev_pitch_type'], batch['prev_zone'],
                 batch['prev_pitch_result'], batch['prev_continuous'],
             )
-            losses = transfusion_loss(outputs, batch, lambda_continuous=lambda_continuous)
+            losses = transfusion_loss(model, outputs, batch, lambda_continuous=lambda_continuous)
             losses['total'].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -606,25 +617,24 @@ def train_model(model, train_dataset, val_dataset, epochs=30, batch_size=128, lr
                 train_losses[k] += losses[k].item()
             n_batches += 1
 
-        scheduler.step()
 
         # Validation
         model.eval()
-        val_losses = {k: 0.0 for k in ['total', 'lm_loss', 'nll_loss']}
+        val_losses = {k: 0.0 for k in ['total', 'lm_loss', 'pt_loss', 'pr_loss', 'ev_loss']}
         val_correct_pt = 0
         val_correct_pr = 0
         val_total = 0
         n_val = 0
 
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader):
                 batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
                 outputs = model(
                     batch['context'], batch['game_state'],
                     batch['prev_pitch_type'], batch['prev_zone'],
                     batch['prev_pitch_result'], batch['prev_continuous'],
                 )
-                losses = transfusion_loss(outputs, batch, lambda_continuous=lambda_continuous)
+                losses = transfusion_loss(model, outputs, batch, lambda_continuous=lambda_continuous)
                 for k in val_losses:
                     val_losses[k] += losses[k].item()
                 n_val += 1
@@ -633,6 +643,8 @@ def train_model(model, train_dataset, val_dataset, epochs=30, batch_size=128, lr
                 val_correct_pt += (outputs['pitch_type_logits'].argmax(-1)[mask] == batch['tgt_pitch_type'][mask]).sum().item()
                 val_correct_pr += (outputs['pitch_result_logits'].argmax(-1)[mask] == batch['tgt_pitch_result'][mask]).sum().item()
                 val_total += mask.sum().item()
+
+        scheduler.step(val_losses['total'])
 
         marker = ''
         vl = val_losses['total'] / max(n_val, 1)
@@ -643,7 +655,7 @@ def train_model(model, train_dataset, val_dataset, epochs=30, batch_size=128, lr
 
         print(f"Epoch {epoch+1}/{epochs} | "
               f"Train: {train_losses['total']/n_batches:.4f} "
-              f"(LM: {train_losses['lm_loss']/n_batches:.4f}, NLL: {train_losses['nll_loss']/n_batches:.4f}) | "
+              f"(LM: {train_losses['lm_loss']/n_batches:.4f} | "
               f"Val: {vl:.4f} | "
               f"PT Acc: {val_correct_pt/max(val_total,1):.2%}, PR Acc: {val_correct_pr/max(val_total,1):.2%} | "
               f"LR: {scheduler.get_last_lr()[0]:.6f}{marker}")
@@ -853,21 +865,34 @@ class GameSimulator:
 
                 outputs = self.model(ctx, gs_t, pt_t, z_t, pr_t, cont_t)
 
+
                 # Take the last timestep's predictions
                 pt_logits = outputs['pitch_type_logits'][0, -1] / temperature
                 z_logits = outputs['zone_logits'][0, -1] / temperature
                 pr_logits = outputs['pitch_result_logits'][0, -1] / temperature
-                cont_mean = outputs['continuous_mean'][0, -1]
-                cont_logvar = outputs['continuous_logvar'][0, -1]
 
                 # Sample discrete outputs
                 sampled_pt = torch.multinomial(F.softmax(pt_logits, dim=-1), 1).item()
                 sampled_zone = torch.multinomial(F.softmax(z_logits, dim=-1), 1).item()
                 sampled_pr = torch.multinomial(F.softmax(pr_logits, dim=-1), 1).item()
 
-                # Sample continuous outputs
-                std = torch.exp(0.5 * cont_logvar)
-                sampled_cont = (cont_mean + std * torch.randn_like(std)).cpu().numpy()
+                # Sample continuous outputs using DDPM
+                # Prepare conditioning: (1, S, d_model) → (1, d_model, S)
+                cond = outputs['continuous_latent'][:, :S, :].permute(0, 2, 1)
+                seq_length = self.model.ddpm.seq_length
+                # Pad or truncate cond to seq_length
+                if cond.shape[2] < seq_length:
+                    pad_amt = seq_length - cond.shape[2]
+                    cond = F.pad(cond, (0, pad_amt))
+                elif cond.shape[2] > seq_length:
+                    cond = cond[:, :, :seq_length]
+                sampled_seq = self.model.ddpm.sample(
+                    batch_size=1,
+                    cond=cond,
+                )
+                # Extract the last valid position's continuous values
+                pos_idx = min(S - 1, seq_length - 1)
+                sampled_cont = sampled_seq[0, :, pos_idx].cpu().numpy()
 
                 # Denormalize continuous values
                 raw_cont = sampled_cont * self.pitch_std + self.pitch_mean

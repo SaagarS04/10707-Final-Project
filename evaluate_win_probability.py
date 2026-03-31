@@ -16,11 +16,17 @@ Usage:
     # Train model first (if no checkpoint):
     python pitch_sequence_predictor.py
 
-    # Run evaluation:
+    # Run evaluation (uses cached data if available):
     python evaluate_win_probability.py --n_sims 10000 --n_games 100
 
-    # Or train + evaluate in one go:
-    python evaluate_win_probability.py --train --epochs 15 --n_sims 1000 --n_games 50
+    # Force reprocessing data (ignore cache):
+    python evaluate_win_probability.py --no_cache --n_sims 5000 --n_games 50
+
+    # Custom cache directory:
+    python evaluate_win_probability.py --cache_dir my_cache --n_sims 1000
+
+    # Train + evaluate with multithreading:
+    python evaluate_win_probability.py --train --epochs 15 --n_threads 4 --n_sims 1000
 """
 
 import os
@@ -32,6 +38,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
+import concurrent.futures
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import pickle
+from pathlib import Path
 
 from pitch_sequence_predictor import (
     PitchSequenceTransfusion,
@@ -268,20 +279,33 @@ def simulate_games_batched(
                 z_lo  = out['zone_logits'][bi, lp]         / temperature
                 pr_lo = out['pitch_result_logits'][bi, lp] / temperature
                 ev_lo = out['at_bat_event_logits'][bi, lp] / temperature
-                c_mu  = out['continuous_mean'][bi, lp]
-                c_lv  = out['continuous_logvar'][bi, lp]
+
+                # Sample continuous via conditioned DDPM
+                # Get transformer latent for conditioning: (csz, S, d_model) → (csz, d_model, S)
+                latent = out['continuous_latent'].permute(0, 2, 1)
+                seq_length = model.ddpm.seq_length
+                # Pad or truncate to DDPM's expected seq_length
+                if latent.shape[2] < seq_length:
+                    latent = F.pad(latent, (0, seq_length - latent.shape[2]))
+                elif latent.shape[2] > seq_length:
+                    latent = latent[:, :, :seq_length]
+                # DDIM sample (fast, ~20 steps configured in model)
+                sampled_seq = model.ddpm.sample(batch_size=csz, cond=latent)
+                # Extract continuous values at each sim's current position
+                # sampled_seq: (csz, n_continuous, seq_length)
+                lp_clamped = lp.clamp(max=seq_length - 1)
+                sc = sampled_seq[bi, :, lp_clamped].cpu().numpy()
 
                 sp = torch.multinomial(F.softmax(pt_lo, -1), 1).squeeze(-1).cpu().numpy()
                 sz = torch.multinomial(F.softmax(z_lo,  -1), 1).squeeze(-1).cpu().numpy()
                 sr = torch.multinomial(F.softmax(pr_lo, -1), 1).squeeze(-1).cpu().numpy()
-                sc = (c_mu + torch.exp(0.5 * c_lv) * torch.randn_like(c_mu)).cpu().numpy()
 
                 s_pt_all[cs:ce]   = sp
                 s_z_all[cs:ce]    = sz
                 s_pr_all[cs:ce]   = sr
                 s_c_all[cs:ce]    = sc
                 ev_log_all[cs:ce] = ev_lo
-
+            
             # ── 3. vectorised count update ──
             safe_pr = np.clip(s_pr_all, 0, _N_PR - 1)
             is_strike = _IS_STRIKE[safe_pr]
@@ -304,7 +328,7 @@ def simulate_games_batched(
             hist_pr[si, nxt[still]] = s_pr_all[sj]
             hist_c[si,  nxt[still]] = s_c_all[sj]
             ab_len[si] += 1
-
+            
             # ── 5. at-bat termination check ──
             k_mask  = strikes[aidx] >= 3
             bb_mask = balls[aidx]   >= 4
@@ -488,20 +512,123 @@ def parse_args():
     p = argparse.ArgumentParser(description='MC Win Probability Evaluation')
     p.add_argument('--model_path', default='pitch_sequence_model.pth')
     p.add_argument('--train', action='store_true', help='Train model before evaluating')
-    p.add_argument('--epochs', type=int, default=15)
-    p.add_argument('--batch_size', type=int, default=128)
-    p.add_argument('--lr', type=float, default=3e-4)
-    p.add_argument('--n_sims', type=int, default=10000, help='Simulations per game')
+    p.add_argument('--epochs', type=int, default=100)
+    p.add_argument('--batch_size', type=int, default=256)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--n_sims', type=int, default=5000, help='Simulations per game')
     p.add_argument('--n_games', type=int, default=0,
                    help='Number of test games to evaluate (0 = all)')
-    p.add_argument('--temperature', type=float, default=0.9)
-    p.add_argument('--forward_chunk', type=int, default=2048,
+    p.add_argument('--temperature', type=float, default=3)
+    p.add_argument('--forward_chunk', type=int, default=256,
                    help='Max batch size for model forward pass')
+    p.add_argument('--n_threads', type=int, default=12,
+                   help='Number of threads for parallel simulation')    
+    p.add_argument('--cache_dir', type=str, default='cache',
+                   help='Directory to store/load preprocessed data cache')
+    p.add_argument('--no_cache', action='store_true',
+                   help='Disable caching (always reprocess data)')    
+    p.add_argument('--ddpm_steps', type=int, default=20,
+                   help='DDIM sampling steps for continuous features (fewer=faster)')
     p.add_argument('--d_model', type=int, default=256, help='Transformer hidden dim')
-    p.add_argument('--n_layers', type=int, default=6, help='Transformer layers')
+    p.add_argument('--n_layers', type=int, default=8, help='Transformer layers')
     p.add_argument('--n_heads', type=int, default=8, help='Attention heads')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--train_pct', type=float, default=1)
+    p.add_argument('--test_pct', type=float, default=1)
     return p.parse_args()
+
+
+def simulate_single_game(args_tuple):
+    """
+    Worker function for simulating a single game.
+    Returns: (game_index, mc_prob, mc_avg_home, mc_avg_away)
+    """
+    (j, gi, model, test_gc_features, ctx_mean, ctx_std, n_sims, 
+     device, idx_to_ev, temperature, forward_chunk, test_game_ids, 
+     progress_counter, progress_lock, n_eval, t0, actuals, log5_probs) = args_tuple
+    
+    try:
+        # Prepare context
+        ctx_row = test_gc_features.iloc[gi].values.astype(np.float32)
+        ctx_normed = (ctx_row - ctx_mean) / ctx_std
+        ctx_normed = np.nan_to_num(ctx_normed, nan=0.0)
+        result = simulate_games_batched(
+            model, ctx_normed, n_sims, device,
+            idx_to_ev=idx_to_ev,
+            temperature=temperature,
+            forward_chunk=forward_chunk,
+        )
+        
+        mc_prob = result['home_wins'] / n_sims
+        mc_avg_h = result['home_scores'].mean()
+        mc_avg_a = result['away_scores'].mean()
+       
+        # Update progress with thread safety
+        with progress_lock:
+            progress_counter[0] += 1
+            completed = progress_counter[0]
+            elapsed = time.time() - t0
+            per_game = elapsed / completed if completed > 0 else 0
+            eta = per_game * (n_eval - completed)
+            game_id = test_game_ids[gi] if test_game_ids is not None else gi
+            actual = actuals[j]
+            log5_prob = log5_probs[j]
+            print(f'  [{completed:4d}/{n_eval}] {game_id}  '
+                  f'MC: {mc_prob:.3f}  Log5: {log5_prob:.3f}  '
+                  f'Actual: {actual:.0f}  '
+                  f'Avg score: {mc_avg_h:.1f}-{mc_avg_a:.1f}  '
+                  f'({per_game:.1f}s/game, ETA {eta/60:.0f}min)')
+        
+        return j, mc_prob, mc_avg_h, mc_avg_a
+        
+    except Exception as e:
+        print(f'Error in game {gi}: {e}')
+        return j, 0.5, 0.0, 0.0  # Default values on error
+
+
+def save_preprocessed_data(cache_dir, data_dict):
+    """Save preprocessed data to cache directory."""
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, 'preprocessed_data.pkl')
+    print(f'Saving preprocessed data to {cache_file}...')
+    with open(cache_file, 'wb') as f:
+        pickle.dump(data_dict, f)
+    print(f'Cache saved successfully.')
+
+
+def load_preprocessed_data(cache_dir):
+    """Load preprocessed data from cache directory."""
+    cache_file = os.path.join(cache_dir, 'preprocessed_data.pkl')
+    if not os.path.exists(cache_file):
+        return None
+    
+    print(f'Loading preprocessed data from {cache_file}...')
+    try:
+        with open(cache_file, 'rb') as f:
+            data_dict = pickle.load(f)
+        print(f'Cache loaded successfully.')
+        return data_dict
+    except Exception as e:
+        print(f'Failed to load cache: {e}')
+        return None
+
+
+def check_cache_validity(cache_dir, expected_files):
+    """Check if cache is still valid by comparing file modification times."""
+    cache_file = os.path.join(cache_dir, 'preprocessed_data.pkl')
+    if not os.path.exists(cache_file):
+        return False
+    
+    cache_time = os.path.getmtime(cache_file)
+    
+    # Check if any expected data files are newer than cache
+    for file_path in expected_files:
+        if os.path.exists(file_path):
+            if os.path.getmtime(file_path) > cache_time:
+                print(f'Cache outdated: {file_path} is newer than cache')
+                return False
+    
+    return True
 
 
 def main():
@@ -514,40 +641,129 @@ def main():
                           else 'cpu')
     print(f'Device: {device}')
 
-    # ── Load data ──
-    print('Loading data...')
-    train_pitch, train_pc, train_pr, train_ab, train_gc = load_data('train')
-    test_pitch,  test_pc,  test_pr,  test_ab,  test_gc  = load_data('test')
+    # ── Check for cached preprocessed data ──
+    cached_data = None
+    expected_files = [
+        'train_pitch_2020-05-12_2025-08-01.csv',
+        'train_pitch_context_2020-05-12_2025-08-01.csv',
+        'train_pitch_result_2020-05-12_2025-08-01.csv',
+        'train_at_bat_target_2020-05-12_2025-08-01.csv',
+        'train_game_context_2020-05-12_2025-08-01.csv',
+        'test_pitch_2025-08-01_2025-11-03.csv',
+        'test_pitch_context_2025-08-01_2025-11-03.csv',
+        'test_pitch_result_2025-08-01_2025-11-03.csv',
+        'test_at_bat_target_2025-08-01_2025-11-03.csv',
+        'test_game_context_2025-08-01_2025-11-03.csv',
+        'train_Game_target_2020-05-12_2025-08-01.csv',
+        'test_Game_target_2025-08-01_2025-11-03.csv',
+    ]
+    
+    if not args.no_cache:
+        if check_cache_validity(args.cache_dir, expected_files):
+            cached_data = load_preprocessed_data(args.cache_dir)
+    
+    if cached_data is not None:
+        print('Using cached preprocessed data.')
+        # Extract cached data
+        train_pitch = cached_data['train_pitch']
+        train_pc = cached_data['train_pc']
+        train_pr = cached_data['train_pr']
+        train_ab = cached_data['train_ab']
+        train_gc = cached_data['train_gc']
+        test_pitch = cached_data['test_pitch']
+        test_pc = cached_data['test_pc']
+        test_pr = cached_data['test_pr']
+        test_ab = cached_data['test_ab']
+        test_gc = cached_data['test_gc']
+        train_gt = cached_data['train_gt']
+        test_gt = cached_data['test_gt']
+        pt_to_idx = cached_data['pt_to_idx']
+        pr_to_idx = cached_data['pr_to_idx']
+        ev_to_idx = cached_data['ev_to_idx']
+        zone_to_idx = cached_data['zone_to_idx']
+        idx_to_ev = cached_data['idx_to_ev']
+        ctx_columns = cached_data['ctx_columns']
+        ctx_mean = cached_data['ctx_mean']
+        ctx_std = cached_data['ctx_std']
+        test_game_ids = cached_data['test_game_ids']
+        test_gc_features = cached_data['test_gc_features']
+        train_gc_features = cached_data['train_gc_features']
+        train_gc_proc = cached_data['train_gc_proc']
+        test_gc_proc = cached_data['test_gc_proc']
+        pitch_mean = cached_data['pitch_mean']
+        pitch_std = cached_data['pitch_std']
+        context_dim = cached_data['context_dim']
+    else:
+        print('Processing data from scratch...')
+        
+        # ── Load data ──
+        print('Loading data...')
+        train_pitch, train_pc, train_pr, train_ab, train_gc = load_data('train')
+        test_pitch,  test_pc,  test_pr,  test_ab,  test_gc  = load_data('test')
 
-    train_gt = pd.read_csv('train_Game_target_2020-05-12_2025-08-01.csv')
-    test_gt  = pd.read_csv('test_Game_target_2025-08-01_2025-11-03.csv')
+        train_gt = pd.read_csv('train_Game_target_2020-05-12_2025-08-01.csv')
+        test_gt  = pd.read_csv('test_Game_target_2025-08-01_2025-11-03.csv')
 
-    pt_to_idx, pr_to_idx, ev_to_idx, zone_to_idx = build_vocab_maps()
-    idx_to_ev = {v: k for k, v in ev_to_idx.items()}
+        pt_to_idx, pr_to_idx, ev_to_idx, zone_to_idx = build_vocab_maps()
+        idx_to_ev = {v: k for k, v in ev_to_idx.items()}
 
-    # ── Process game context ──
-    print('Processing game context...')
-    train_gc_proc, ctx_columns, ctx_mean, ctx_std = prepare_game_context(train_gc, is_train=True)
+        # ── Process game context ──
+        print('Processing game context...')
+        train_gc_proc, ctx_columns, ctx_mean, ctx_std = prepare_game_context(train_gc, is_train=True)
 
-    # Align test game context to train columns
-    test_gc_proc = test_gc.drop(columns=['game_date'], errors='ignore').copy()
-    test_game_ids = test_gc_proc['game_id'].values if 'game_id' in test_gc_proc.columns else None
-    test_gc_features = test_gc_proc.drop(columns=['game_id'], errors='ignore')
-    test_gc_features = pd.get_dummies(test_gc_features, drop_first=True).astype(float)
-    test_gc_features = test_gc_features.reindex(columns=ctx_columns, fill_value=0)
+        # Align test game context to train columns
+        test_gc_proc = test_gc.drop(columns=['game_date'], errors='ignore').copy()
+        test_game_ids = test_gc_proc['game_id'].values if 'game_id' in test_gc_proc.columns else None
+        test_gc_features = test_gc_proc.drop(columns=['game_id'], errors='ignore')
+        test_gc_features = pd.get_dummies(test_gc_features, drop_first=True).astype(float)
+        test_gc_features = test_gc_features.reindex(columns=ctx_columns, fill_value=0)
 
-    # Also need train features for logistic regression (before normalization)
-    train_gc_features = train_gc_proc.drop(columns=['game_id'], errors='ignore')
+        # Also need train features for logistic regression (before normalization)
+        train_gc_features = train_gc_proc.drop(columns=['game_id'], errors='ignore')
 
-    # Continuous pitch normalisation
-    print('Computing pitch normalisation stats...')
-    cont_vals = train_pitch[CONTINUOUS_PITCH_COLS].values.astype(np.float32)
-    cont_vals = np.nan_to_num(cont_vals, nan=0.0)
-    pitch_mean = cont_vals.mean(axis=0)
-    pitch_std  = cont_vals.std(axis=0)
-    pitch_std[pitch_std < 1e-8] = 1.0
+        # Continuous pitch normalisation
+        print('Computing pitch normalisation stats...')
+        cont_vals = train_pitch[CONTINUOUS_PITCH_COLS].values.astype(np.float32)
+        cont_vals = np.nan_to_num(cont_vals, nan=0.0)
+        pitch_mean = cont_vals.mean(axis=0)
+        pitch_std  = cont_vals.std(axis=0)
+        pitch_std[pitch_std < 1e-8] = 1.0
 
-    context_dim = len(ctx_columns)
+        context_dim = len(ctx_columns)
+        
+        # ── Save preprocessed data to cache ──
+        if not args.no_cache:
+            cache_data = {
+                'train_pitch': train_pitch,
+                'train_pc': train_pc,
+                'train_pr': train_pr,
+                'train_ab': train_ab,
+                'train_gc': train_gc,
+                'test_pitch': test_pitch,
+                'test_pc': test_pc,
+                'test_pr': test_pr,
+                'test_ab': test_ab,
+                'test_gc': test_gc,
+                'train_gt': train_gt,
+                'test_gt': test_gt,
+                'pt_to_idx': pt_to_idx,
+                'pr_to_idx': pr_to_idx,
+                'ev_to_idx': ev_to_idx,
+                'zone_to_idx': zone_to_idx,
+                'idx_to_ev': idx_to_ev,
+                'ctx_columns': ctx_columns,
+                'ctx_mean': ctx_mean,
+                'ctx_std': ctx_std,
+                'test_game_ids': test_game_ids,
+                'test_gc_features': test_gc_features,
+                'train_gc_features': train_gc_features,
+                'train_gc_proc': train_gc_proc,
+                'test_gc_proc': test_gc_proc,
+                'pitch_mean': pitch_mean,
+                'pitch_std': pitch_std,
+                'context_dim': context_dim,
+            }
+            save_preprocessed_data(args.cache_dir, cache_data)
 
     # ── Train or load model ──
     if args.train or not os.path.exists(args.model_path):
@@ -562,6 +778,18 @@ def main():
         test_gc_with_id = test_gc_features.copy()
         if test_game_ids is not None:
             test_gc_with_id['game_id'] = test_game_ids
+
+        n = int(len(train_pitch) * args.train_pct)
+        train_pitch = train_pitch[-n:]
+        train_pc = train_pc[-n:]
+        train_pr = train_pr[-n:]
+        train_ab = train_ab[-n:]
+
+        m = int(len(train_pitch) * args.test_pct)
+        test_pitch = test_pitch[-m:]
+        test_pc = test_pc[-m:]
+        test_pr = test_pr[-m:]
+        test_ab = test_ab[-m:]
 
         train_dataset = AtBatSequenceDataset(
             train_pitch, train_pc, train_pr, train_ab, train_gc_with_id,
@@ -620,9 +848,13 @@ def main():
         n_heads = ckpt.get('n_heads', args.n_heads)
         model = PitchSequenceTransfusion(
             context_dim=context_dim, d_model=d_model, n_heads=n_heads,
-            n_layers=n_layers, dropout=0.1, max_seq_len=256,
+            n_layers=n_layers, dropout=0.25, max_seq_len=256,
         )
         model.load_state_dict(ckpt['model_state_dict'])
+
+    # Apply DDIM sampling steps from CLI arg
+    model.ddpm.sampling_timesteps = args.ddpm_steps
+    model.ddpm.is_ddim_sampling = args.ddpm_steps < model.ddpm.num_timesteps
 
     model = model.to(device).eval()
 
@@ -668,38 +900,66 @@ def main():
         have_lr = False
 
     # ── MC simulation ──
-    print('\nRunning Monte Carlo simulations...')
+    print(f'\nRunning Monte Carlo simulations using {args.n_threads} threads...')
     mc_probs  = np.zeros(n_eval)
     mc_avg_hs = np.zeros(n_eval)
     mc_avg_as = np.zeros(n_eval)
 
+    # Thread-safe progress tracking
+    progress_counter = [0]  # Use list for mutability
+    progress_lock = threading.Lock()
     t0 = time.time()
-    for j, gi in enumerate(eval_idx):
-        # Prepare context
-        ctx_row = test_gc_features.iloc[gi].values.astype(np.float32)
-        ctx_normed = (ctx_row - ctx_mean) / ctx_std
-        ctx_normed = np.nan_to_num(ctx_normed, nan=0.0)
 
-        result = simulate_games_batched(
-            model, ctx_normed, args.n_sims, device,
-            idx_to_ev=idx_to_ev,
-            temperature=args.temperature,
-            forward_chunk=args.forward_chunk,
-        )
-        mc_probs[j]  = result['home_wins'] / args.n_sims
-        mc_avg_hs[j] = result['home_scores'].mean()
-        mc_avg_as[j] = result['away_scores'].mean()
+    if args.n_threads == 1:
+        # Single-threaded execution (original behavior)
+        for j, gi in enumerate(eval_idx):
+            # Prepare context
+            ctx_row = test_gc_features.iloc[gi].values.astype(np.float32)
+            ctx_normed = (ctx_row - ctx_mean) / ctx_std
+            ctx_normed = np.nan_to_num(ctx_normed, nan=0.0)
 
-        elapsed = time.time() - t0
-        per_game = elapsed / (j + 1)
-        eta = per_game * (n_eval - j - 1)
-        game_id = test_game_ids[gi] if test_game_ids is not None else gi
-        actual = actuals[j]
-        print(f'  [{j+1:4d}/{n_eval}] {game_id}  '
-              f'MC: {mc_probs[j]:.3f}  Log5: {log5_probs[j]:.3f}  '
-              f'Actual: {actual:.0f}  '
-              f'Avg score: {mc_avg_hs[j]:.1f}-{mc_avg_as[j]:.1f}  '
-              f'({per_game:.1f}s/game, ETA {eta/60:.0f}min)')
+            result = simulate_games_batched(
+                model, ctx_normed, args.n_sims, device,
+                idx_to_ev=idx_to_ev,
+                temperature=args.temperature,
+                forward_chunk=args.forward_chunk,
+            )
+            mc_probs[j]  = result['home_wins'] / args.n_sims
+            mc_avg_hs[j] = result['home_scores'].mean()
+            mc_avg_as[j] = result['away_scores'].mean()
+
+            elapsed = time.time() - t0
+            per_game = elapsed / (j + 1)
+            eta = per_game * (n_eval - j - 1)
+            game_id = test_game_ids[gi] if test_game_ids is not None else gi
+            actual = actuals[j]
+            print(f'  [{j+1:4d}/{n_eval}] {game_id}  '
+                  f'MC: {mc_probs[j]:.3f}  Log5: {log5_probs[j]:.3f}  '
+                  f'Actual: {actual:.0f}  '
+                  f'Avg score: {mc_avg_hs[j]:.1f}-{mc_avg_as[j]:.1f}  '
+                  f'({per_game:.1f}s/game, ETA {eta/60:.0f}min)')
+    else:
+        # Multi-threaded execution
+        # Prepare arguments for worker threads
+        thread_args = []
+        for j, gi in enumerate(eval_idx):
+            args_tuple = (j, gi, model, test_gc_features, ctx_mean, ctx_std, args.n_sims,
+                         device, idx_to_ev, args.temperature, args.forward_chunk, test_game_ids,
+                         progress_counter, progress_lock, n_eval, t0, actuals, log5_probs)
+            thread_args.append(args_tuple)
+
+        # Execute simulations in parallel
+        with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
+            # Submit all tasks
+            futures = [executor.submit(simulate_single_game, args_tuple) 
+                      for args_tuple in thread_args]
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                j, mc_prob, mc_avg_h, mc_avg_a = future.result()
+                mc_probs[j] = mc_prob
+                mc_avg_hs[j] = mc_avg_h
+                mc_avg_as[j] = mc_avg_a
 
     total_time = time.time() - t0
     print(f'\nSimulation complete: {total_time:.0f}s total, {total_time/n_eval:.1f}s per game')
