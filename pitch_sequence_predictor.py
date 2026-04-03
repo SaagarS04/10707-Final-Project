@@ -784,11 +784,15 @@ class GameSimulator:
 
         while outs < 3:
             at_bat_num += 1
+            bases_before = list(bases)
+            outs_before = outs
             ab_result = self._simulate_at_bat(
                 inning=inning, is_top=is_top, outs=outs,
                 home_score=home_score, away_score=away_score,
                 bases=bases, temperature=temperature, verbose=verbose,
             )
+            ab_result['bases_before'] = bases_before
+            ab_result['outs_before'] = outs_before
             half_log.append(ab_result)
 
             # Process the at-bat event

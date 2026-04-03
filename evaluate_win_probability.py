@@ -44,9 +44,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pickle
 from pathlib import Path
 
+from mcmc_simulator import MHGameSampler
 from pitch_sequence_predictor import (
     PitchSequenceTransfusion,
     AtBatSequenceDataset,
+    GameSimulator,
     collate_at_bats,
     train_model,
     load_data,
@@ -535,6 +537,15 @@ def parse_args():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--train_pct', type=float, default=1)
     p.add_argument('--test_pct', type=float, default=1)
+    # MCMC options
+    p.add_argument('--mcmc', action='store_true',
+                   help='Use Metropolis-Hastings MCMC instead of batched Monte Carlo')
+    p.add_argument('--mcmc_steps', type=int, default=500,
+                   help='Number of post-burn-in MH steps per game')
+    p.add_argument('--mcmc_burnin', type=int, default=100,
+                   help='Number of burn-in steps to discard before collecting samples')
+    p.add_argument('--lambda_cal', type=float, default=0.5,
+                   help='RE24 calibration weight λ (0=pure model, 1=full calibration)')
     return p.parse_args()
 
 
@@ -899,19 +910,66 @@ def main():
         lr_probs = np.full(n_eval, hist_rate)
         have_lr = False
 
-    # ── MC simulation ──
-    print(f'\nRunning Monte Carlo simulations using {args.n_threads} threads...')
+    # ── Simulation (MC or MCMC) ──
+    use_mcmc = getattr(args, 'mcmc', False)
+    sim_label = 'MCMC (MH)' if use_mcmc else 'Monte Carlo'
+    print(f'\nRunning {sim_label} simulations using {args.n_threads} threads...')
     mc_probs  = np.zeros(n_eval)
     mc_avg_hs = np.zeros(n_eval)
     mc_avg_as = np.zeros(n_eval)
+    mcmc_acceptance_rates = np.zeros(n_eval)  # only populated when --mcmc is set
 
     # Thread-safe progress tracking
     progress_counter = [0]  # Use list for mutability
     progress_lock = threading.Lock()
     t0 = time.time()
 
-    if args.n_threads == 1:
-        # Single-threaded execution (original behavior)
+    if use_mcmc:
+        # ── MCMC path: one MH chain per game, single-threaded ──
+        # (Chains are inherently sequential; parallelism across games is future work.)
+        for j, gi in enumerate(eval_idx):
+            ctx_row = test_gc_features.iloc[gi].values.astype(np.float32)
+            ctx_normed = (ctx_row - ctx_mean) / ctx_std
+            ctx_normed = np.nan_to_num(ctx_normed, nan=0.0)
+
+            simulator = GameSimulator(
+                model=model,
+                context_features=ctx_normed,
+                pt_to_idx=pt_to_idx,
+                pr_to_idx=pr_to_idx,
+                ev_to_idx=ev_to_idx,
+                zone_to_idx=zone_to_idx,
+                pitch_mean=pitch_mean,
+                pitch_std=pitch_std,
+                device=device,
+            )
+            sampler = MHGameSampler(
+                simulator=simulator,
+                lambda_cal=args.lambda_cal,
+                temperature=args.temperature,
+            )
+            chain_result = sampler.run_chain(
+                n_steps=args.mcmc_steps,
+                burn_in=args.mcmc_burnin,
+            )
+
+            mc_probs[j] = chain_result['win_probability']
+            mcmc_acceptance_rates[j] = chain_result['acceptance_rate']
+            # MCMC doesn't track per-game average scores; leave at 0.
+
+            elapsed = time.time() - t0
+            per_game = elapsed / (j + 1)
+            eta = per_game * (n_eval - j - 1)
+            game_id = test_game_ids[gi] if test_game_ids is not None else gi
+            actual = actuals[j]
+            print(f'  [{j+1:4d}/{n_eval}] {game_id}  '
+                  f'MCMC: {mc_probs[j]:.3f}  Log5: {log5_probs[j]:.3f}  '
+                  f'Actual: {actual:.0f}  '
+                  f'AcceptRate: {mcmc_acceptance_rates[j]:.2f}  '
+                  f'({per_game:.1f}s/game, ETA {eta/60:.0f}min)')
+
+    elif args.n_threads == 1:
+        # Single-threaded MC (original behavior)
         for j, gi in enumerate(eval_idx):
             # Prepare context
             ctx_row = test_gc_features.iloc[gi].values.astype(np.float32)
@@ -977,7 +1035,8 @@ def main():
     }
     if have_lr:
         methods['Logistic reg'] = lr_probs
-    methods['MC simulation'] = mc_probs
+    sim_method_label = 'MCMC (MH)' if use_mcmc else 'MC simulation'
+    methods[sim_method_label] = mc_probs
 
     print(f'\n{"Method":<20} {"Brier↓":>8} {"LogLoss↓":>10} {"Accuracy":>10}')
     print('-' * 52)
@@ -987,15 +1046,21 @@ def main():
         acc = accuracy(probs, actuals)
         print(f'{name:<20} {bs:>8.4f} {ll:>10.4f} {acc:>10.2%}')
 
-    # Calibration for MC simulation
-    print(f'\nCalibration (MC simulation):')
+    # Calibration for simulation method
+    print(f'\nCalibration ({sim_method_label}):')
     cal = calibration_table(mc_probs, actuals, n_bins=5)
     print(cal.to_string(index=False))
 
-    # Score distribution
-    print(f'\nMC Score Distributions:')
-    print(f'  Avg home score: {mc_avg_hs.mean():.2f} ± {mc_avg_hs.std():.2f}')
-    print(f'  Avg away score: {mc_avg_as.mean():.2f} ± {mc_avg_as.std():.2f}')
+    if use_mcmc:
+        print(f'\nMCMC Chain Diagnostics:')
+        print(f'  Mean acceptance rate: {mcmc_acceptance_rates.mean():.3f}')
+        print(f'  Min / Max acceptance: {mcmc_acceptance_rates.min():.3f} / {mcmc_acceptance_rates.max():.3f}')
+        print(f'  (λ={args.lambda_cal}, steps={args.mcmc_steps}, burn-in={args.mcmc_burnin})')
+    else:
+        # Score distribution (only meaningful for batched MC)
+        print(f'\nMC Score Distributions:')
+        print(f'  Avg home score: {mc_avg_hs.mean():.2f} ± {mc_avg_hs.std():.2f}')
+        print(f'  Avg away score: {mc_avg_as.mean():.2f} ± {mc_avg_as.std():.2f}')
 
     # Save results
     results_df = pd.DataFrame({
