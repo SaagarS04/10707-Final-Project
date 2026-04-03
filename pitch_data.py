@@ -1,5 +1,3 @@
-from xgboost import train
-
 from pybaseball import statcast, statcast_pitcher, statcast_pitcher_percentile_ranks, standings, statcast_batter_percentile_ranks
 import pandas as pd
 import numpy as np
@@ -187,7 +185,8 @@ def get_pitcher_historical_stats(pitchers):
     
     # Return DataFrame with meaningful column names preserved
     result_df = pd.DataFrame.from_dict(pitch_stats, orient='index')
-    result_df.columns = meaningful_cols  # Ensure column names are preserved
+    if not result_df.empty:
+        result_df.columns = meaningful_cols
     return result_df
 
 def get_batter_historical_stats(batters):
@@ -212,7 +211,8 @@ def get_batter_historical_stats(batters):
     
     # Return DataFrame with meaningful column names preserved
     result_df = pd.DataFrame.from_dict(batter_stats, orient='index')
-    result_df.columns = meaningful_cols  # Ensure column names are preserved
+    if not result_df.empty:
+        result_df.columns = meaningful_cols
     return result_df
 
 def get_team_records_data(games_df):
@@ -524,7 +524,7 @@ def get_transformed_data(start_dt, end_dt, weather = True, weather_api_key='VQVK
     pitch_context = pitch_context.merge(pitcher_stats, left_on='pitcher', right_index=True, how='left', suffixes=('', '_pit'))
     pitch_context = pitch_context.merge(batter_stats, left_on='batter', right_index=True, how='left', suffixes=('', '_bat'))
 
-    pitch_context = pitch_context.drop(columns=['age_pit', 'age_bat', 'if_fielding_alignment', 'of_fielding_alignment', 'oaa'])
+    pitch_context = pitch_context.drop(columns=['age_pit', 'age_bat', 'if_fielding_alignment', 'of_fielding_alignment', 'oaa'], errors='ignore')
     pitch_context[['on_1b', 'on_2b', 'on_3b']] = pitch_context[['on_1b', 'on_2b', 'on_3b']].fillna(0)
 
     pitch_context = pitch_context.loc[:, ~pitch_context.columns.duplicated()].copy()
@@ -557,11 +557,13 @@ def get_transformed_data(start_dt, end_dt, weather = True, weather_api_key='VQVK
     pitch = pitch.sort_values(['at_bat_id', 'pitch_id'])
 
     pitch_context = pitch_context.sort_values(['at_bat_id', 'pitch_id'])
-    batter_context = pitch_context.groupby('game_id', as_index=False).first()[['game_id', 'batter_days_since_prev_game', 'xwoba', 'xba','xslg', 'xiso', 'xobp', 'brl', 'brl_percent', 'exit_velocity', 'max_ev', 'hard_hit_percent',
+    _batter_context_cols = ['game_id', 'batter_days_since_prev_game', 'xwoba', 'xba', 'xslg', 'xiso', 'xobp', 'brl', 'brl_percent', 'exit_velocity', 'max_ev', 'hard_hit_percent',
                    'k_percent', 'bb_percent', 'whiff_percent', 'chase_percent', 'xera', 'fb_velocity', 'fb_spin', 'curve_spin', 'xwoba_bat', 'xba_bat',
                    'xslg_bat', 'xiso_bat', 'xobp_bat', 'brl_bat', 'brl_percent_bat', 'exit_velocity_bat', 'max_ev_bat', 'hard_hit_percent_bat',
                    'k_percent_bat', 'bb_percent_bat', 'whiff_percent_bat', 'chase_percent_bat', 'arm_strength', 'sprint_speed', 'bat_speed', 'squared_up_rate',
-                   'swing_length', 'inning_topbot_Top', 'stand_R', 'p_throws_R']]
+                   'swing_length', 'inning_topbot_Top', 'stand_R', 'p_throws_R']
+    _batter_context_cols = [c for c in _batter_context_cols if c in pitch_context.columns]
+    batter_context = pitch_context.groupby('game_id', as_index=False).first()[_batter_context_cols]
     
     game_context = game_context.merge(batter_context, left_index = True, right_on='game_id', how='left')
 

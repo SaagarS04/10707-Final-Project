@@ -426,7 +426,7 @@ class AtBatSequenceDataset(Dataset):
                 tgt_at_bat_event[i] = self.ev_to_idx[ev_str]
 
             # Continuous targets (normalized)
-            cont_vals = row[CONTINUOUS_PITCH_COLS].values.astype(np.float32)
+            cont_vals = row[CONTINUOUS_PITCH_COLS].fillna(0).values.astype(np.float32)
             cont_vals = np.nan_to_num(cont_vals, nan=0.0)
             tgt_continuous[i] = (cont_vals - self.pitch_mean) / self.pitch_std
 

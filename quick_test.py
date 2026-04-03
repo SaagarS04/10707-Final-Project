@@ -59,6 +59,8 @@ def parse_args():
     p.add_argument('--mcmc_burnin', type=int,   default=50)
     p.add_argument('--lambda_cal',  type=float, default=0.5)
     p.add_argument('--temperature', type=float, default=2.0)
+    p.add_argument('--ddpm_steps',  type=int,   default=5,
+                   help='DDIM sampling steps for continuous features (fewer=faster, 5 is fine for testing)')
     p.add_argument('--seed',        type=int,   default=42)
     p.add_argument('--plot',        action='store_true', default=True,
                    help='Save diagnostic plots to mcmc_plots.png')
@@ -137,7 +139,7 @@ def plot_all(all_results: list, re24_table: dict, args, save_path='mcmc_plots.pn
         innings, wp_mean, _, _ = win_prob_by_inning(result['trajectories'])
         color = colors[idx % len(colors)]
         ax.plot(innings, wp_mean, marker='o', color=color, linewidth=1.8,
-                label=f'{game_id[:12]}… (actual={int(actual)})')
+                label=f'{str(game_id)[:12]}… (actual={int(actual)})')
 
     ax.axhline(0.5, color='grey', linestyle='--', linewidth=0.8, alpha=0.6)
     ax.set_xlabel('Inning')
@@ -154,7 +156,7 @@ def plot_all(all_results: list, re24_table: dict, args, save_path='mcmc_plots.pn
         running_mean = np.cumsum(win_samples) / np.arange(1, len(win_samples) + 1)
         color = colors[idx % len(colors)]
         ax.plot(running_mean, color=color, linewidth=1.5,
-                label=f'{game_id[:12]}…')
+                label=f'{str(game_id)[:12]}…')
 
     ax.axhline(0.5, color='grey', linestyle='--', linewidth=0.8, alpha=0.6)
     ax.set_xlabel('Chain step (post burn-in)')
@@ -178,7 +180,7 @@ def plot_all(all_results: list, re24_table: dict, args, save_path='mcmc_plots.pn
     ax.axhline(0, color='grey', linestyle='--', linewidth=0.8, alpha=0.6)
     ax.set_xlabel('Inning')
     ax.set_ylabel('Score differential (home − away)')
-    ax.set_title(f'Score Progression: {game_id[:20]}… (actual={int(actual)})')
+    ax.set_title(f'Score Progression: {str(game_id)[:20]}… (actual={int(actual)})')
     ax.set_xticks(range(1, 10))
     ax.legend(fontsize=8)
 
@@ -244,15 +246,15 @@ def main():
 
     train_pitch = train_data['pitch']
     train_pc    = train_data['pitch_context']
-    train_pr    = train_data['pitch_result']
-    train_ab    = train_data['at_bat_target']
+    train_pr    = train_data['pitch_result'].to_frame('description') if hasattr(train_data['pitch_result'], 'to_frame') else train_data['pitch_result']
+    train_ab    = train_data['at_bat_target'].to_frame('events') if hasattr(train_data['at_bat_target'], 'to_frame') else train_data['at_bat_target']
     train_gc    = train_data['game_context']
     re24_table  = train_data['re24_table']
 
     test_pitch  = test_data['pitch']
     test_pc     = test_data['pitch_context']
-    test_pr     = test_data['pitch_result']
-    test_ab     = test_data['at_bat_target']
+    test_pr     = test_data['pitch_result'].to_frame('description') if hasattr(test_data['pitch_result'], 'to_frame') else test_data['pitch_result']
+    test_ab     = test_data['at_bat_target'].to_frame('events') if hasattr(test_data['at_bat_target'], 'to_frame') else test_data['at_bat_target']
     test_gc     = test_data['game_context']
     test_gt     = test_data['Game_target']
 
@@ -269,7 +271,7 @@ def main():
     ctx_std[ctx_std < 1e-8] = 1.0
     context_dim = len(ctx_columns)
 
-    cont_vals  = train_pitch[CONTINUOUS_PITCH_COLS].values.astype(np.float32)
+    cont_vals  = train_pitch[CONTINUOUS_PITCH_COLS].fillna(0).values.astype(np.float32)
     cont_vals  = np.nan_to_num(cont_vals, nan=0.0)
     pitch_mean = cont_vals.mean(axis=0)
     pitch_std  = cont_vals.std(axis=0)
@@ -316,6 +318,9 @@ def main():
         batch_size=64,
         lr=1e-3,
     )
+    # Override DDIM sampling steps for faster inference (does not affect model quality,
+    # only the number of reverse diffusion steps used during simulation)
+    model.ddpm.sampling_timesteps = args.ddpm_steps
     model.eval()
 
     # ── Run MCMC on test games ─────────────────────────────────────────────────
