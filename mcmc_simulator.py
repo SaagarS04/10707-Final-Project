@@ -148,6 +148,9 @@ class MHGameSampler:
                        - 1.0: full RE24 calibration correction.
         temperature: Softmax temperature for the Transfusion model's discrete outputs.
                      Values < 1 sharpen the distribution; values > 1 flatten it.
+        re24_table:  Optional dict keyed by (on_1b, on_2b, on_3b, outs) → expected runs,
+                     as computed by pitch_data.compute_re24_from_pitch_context. If None,
+                     falls back to the module-level hardcoded historical averages.
     """
 
     def __init__(
@@ -155,10 +158,14 @@ class MHGameSampler:
         simulator: GameSimulator,
         lambda_cal: float = 0.5,
         temperature: float = 1.0,
+        re24_table: dict = None,
     ):
         self.simulator = simulator
         self.lambda_cal = lambda_cal
         self.temperature = temperature
+        # Use data-driven RE24 if provided, otherwise fall back to hardcoded constants
+        self._re24 = re24_table if re24_table is not None else RE24_TABLE
+        self._log_max_re24 = math.log(max(self._re24.values()))
 
     # ------------------------------------------------------------------
     # Public API
@@ -384,8 +391,8 @@ class MHGameSampler:
             int(outs_before),
         )
         # Fall back to the minimum table value if key is somehow missing.
-        re = RE24_TABLE.get(key, 0.098)
-        return math.log(re) - _LOG_MAX_RE24
+        re = self._re24.get(key, min(self._re24.values()))
+        return math.log(re) - self._log_max_re24
 
     # ------------------------------------------------------------------
     # Utility

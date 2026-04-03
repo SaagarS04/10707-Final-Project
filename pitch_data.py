@@ -14,6 +14,157 @@ warnings.filterwarnings("ignore")
     
 pybaseball.cache.enable()
 
+
+def compute_re24_table(df: pd.DataFrame) -> dict:
+    """Compute the RE24 run-expectancy table from raw Statcast pitch-level data.
+
+    For each plate appearance, records the base/out state at the start of the PA
+    and the runs scored by the batting team from that PA to the end of the half-inning.
+    Averages over all PAs with the same base/out state to produce a 24-cell table.
+
+    Args:
+        df: Raw Statcast DataFrame (as returned by pybaseball.statcast), which must
+            contain columns: game_pk, inning, inning_topbot, at_bat_number,
+            on_1b, on_2b, on_3b, outs_when_up, home_score, away_score.
+
+    Returns:
+        A dict keyed by (on_1b: bool, on_2b: bool, on_3b: bool, outs: int)
+        with float values representing expected runs from that state to end of inning.
+        Any of the 24 cells missing from the data fall back to 0.098 (empty bases, 2 outs).
+    """
+    required = {'game_pk', 'inning', 'inning_topbot', 'at_bat_number',
+                'on_1b', 'on_2b', 'on_3b', 'outs_when_up', 'home_score', 'away_score'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"compute_re24_table: missing columns {missing}")
+
+    work = df[list(required)].copy()
+
+    # Determine batting team's score at each pitch (the score that accumulates as runs score)
+    work['batting_score'] = np.where(
+        work['inning_topbot'] == 'Top',
+        work['away_score'],
+        work['home_score'],
+    )
+
+    # Half-inning identifier: unique per (game, inning, top/bottom)
+    work['half_inning_id'] = (
+        work['game_pk'].astype(str) + '_'
+        + work['inning'].astype(str) + '_'
+        + work['inning_topbot']
+    )
+
+    # Maximum batting score reached in each half-inning = runs at end of inning
+    inning_end = work.groupby('half_inning_id')['batting_score'].max()
+    work['inning_end_score'] = work['half_inning_id'].map(inning_end)
+
+    # Unique plate appearance identifier
+    work['pa_id'] = work['game_pk'].astype(str) + '_' + work['at_bat_number'].astype(str)
+
+    # Take only the first pitch of each PA to capture the state at PA start
+    first_pitches = work.groupby('pa_id', sort=False).first().reset_index()
+
+    # Runs scored from the start of this PA to the end of the half-inning
+    first_pitches['runs_from_pa'] = (
+        first_pitches['inning_end_score'] - first_pitches['batting_score']
+    ).clip(lower=0)
+
+    # Binarize base occupancy (Statcast stores player IDs or NaN, not booleans)
+    first_pitches['on_1b_b'] = first_pitches['on_1b'].notna() & (first_pitches['on_1b'] != 0)
+    first_pitches['on_2b_b'] = first_pitches['on_2b'].notna() & (first_pitches['on_2b'] != 0)
+    first_pitches['on_3b_b'] = first_pitches['on_3b'].notna() & (first_pitches['on_3b'] != 0)
+
+    # Average runs by base/out state
+    grouped = (
+        first_pitches
+        .groupby(['on_1b_b', 'on_2b_b', 'on_3b_b', 'outs_when_up'])['runs_from_pa']
+        .mean()
+    )
+
+    # Build the 24-cell dict, falling back to 0.098 for any unseen state
+    re24 = {}
+    for outs in range(3):
+        for b1 in (False, True):
+            for b2 in (False, True):
+                for b3 in (False, True):
+                    key = (b1, b2, b3, outs)
+                    try:
+                        re24[key] = float(grouped.loc[key])
+                    except KeyError:
+                        re24[key] = 0.098  # fallback: empty bases, 2 outs
+
+    return re24
+
+def compute_re24_from_pitch_context(pitch_context_df: pd.DataFrame) -> dict:
+    """Compute the RE24 run-expectancy table from a preprocessed pitch_context dataframe.
+
+    This is the companion to compute_re24_table for use when the raw Statcast df is not
+    available (e.g., when loading from cached CSVs). It expects the already-processed
+    pitch_context format produced by get_transformed_data, where:
+      - on_1b/on_2b/on_3b are numeric (0 = no runner, nonzero = runner present)
+      - inning_topbot_Top is a one-hot float (1.0 = top/away bats, 0.0 = bottom/home bats)
+      - home_score, away_score are numeric scores at the time of each pitch
+      - outs_when_up is the out count (0, 1, or 2) at the time of each pitch
+      - game_id and at_bat_id columns identify the half-inning and plate appearance
+
+    Args:
+        pitch_context_df: Preprocessed pitch_context DataFrame (as loaded from CSV).
+
+    Returns:
+        A dict keyed by (on_1b: bool, on_2b: bool, on_3b: bool, outs: int) with float
+        values for expected runs from that state to end of inning.
+    """
+    pc = pitch_context_df.copy()
+
+    # Batting team score: away team scores in top half, home team scores in bottom half
+    is_top = pc['inning_topbot_Top'].astype(bool)
+    pc['batting_score'] = np.where(is_top, pc['away_score'], pc['home_score'])
+
+    # Half-inning identifier using game_id + inning + top/bottom
+    pc['half_inning_id'] = (
+        pc['game_id'].astype(str) + '_'
+        + pc['inning'].astype(int).astype(str) + '_'
+        + is_top.astype(str)
+    )
+
+    # Max batting score in each half-inning = runs at end of that half-inning
+    inning_end = pc.groupby('half_inning_id')['batting_score'].max()
+    pc['inning_end_score'] = pc['half_inning_id'].map(inning_end)
+
+    # First pitch of each plate appearance captures the state at PA start
+    first_pitches = pc.groupby(['game_id', 'at_bat_id'], sort=False).first().reset_index()
+
+    # Runs scored from this PA to end of inning (clamp at 0 to handle any edge cases)
+    first_pitches['runs_from_pa'] = (
+        first_pitches['inning_end_score'] - first_pitches['batting_score']
+    ).clip(lower=0)
+
+    # Binarize base occupancy (0 = no runner, nonzero = runner present)
+    first_pitches['on_1b_b'] = first_pitches['on_1b'] != 0
+    first_pitches['on_2b_b'] = first_pitches['on_2b'] != 0
+    first_pitches['on_3b_b'] = first_pitches['on_3b'] != 0
+
+    grouped = (
+        first_pitches
+        .groupby(['on_1b_b', 'on_2b_b', 'on_3b_b', 'outs_when_up'])['runs_from_pa']
+        .mean()
+    )
+
+    # Build the 24-cell dict with fallback for any unseen state
+    re24 = {}
+    for outs in range(3):
+        for b1 in (False, True):
+            for b2 in (False, True):
+                for b3 in (False, True):
+                    key = (b1, b2, b3, outs)
+                    try:
+                        re24[key] = float(grouped.loc[key])
+                    except KeyError:
+                        re24[key] = 0.098
+
+    return re24
+
+
 def get_pitcher_historical_stats(pitchers):
     data = []
     for year in range(2018, 2025):
@@ -415,6 +566,10 @@ def get_transformed_data(start_dt, end_dt, weather = True, weather_api_key='VQVK
     game_context = game_context.merge(batter_context, left_index = True, right_on='game_id', how='left')
 
 
+    # Compute RE24 run-expectancy table from raw Statcast data before any encoding
+    re24_table = compute_re24_table(df)
+    print(f"  RE24 table computed from {len(df)} pitches.")
+
     res_dict = {
         'game_context': game_context,
         'pitch_context': pitch_context,
@@ -422,7 +577,8 @@ def get_transformed_data(start_dt, end_dt, weather = True, weather_api_key='VQVK
         'first_pitch' : pitch.groupby('game_id').first().drop(columns=['game_date', 'home_team', 'away_team', 'at_bat_id', 'pitch_id']),
         'pitch_result' : pitch_results,
         'at_bat_target' : play_results,
-        'Game_target' : home_team_win_target.reset_index()['home_win_exp']
-    }   
+        'Game_target' : home_team_win_target.reset_index()['home_win_exp'],
+        're24_table' : re24_table,
+    }
 
     return res_dict

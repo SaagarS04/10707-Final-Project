@@ -45,6 +45,7 @@ import pickle
 from pathlib import Path
 
 from mcmc_simulator import MHGameSampler
+from pitch_data import compute_re24_from_pitch_context
 from pitch_sequence_predictor import (
     PitchSequenceTransfusion,
     AtBatSequenceDataset,
@@ -704,6 +705,7 @@ def main():
         pitch_mean = cached_data['pitch_mean']
         pitch_std = cached_data['pitch_std']
         context_dim = cached_data['context_dim']
+        re24_table = cached_data.get('re24_table', None)  # None triggers hardcoded fallback
     else:
         print('Processing data from scratch...')
         
@@ -741,7 +743,11 @@ def main():
         pitch_std[pitch_std < 1e-8] = 1.0
 
         context_dim = len(ctx_columns)
-        
+
+        # ── Compute RE24 table from training pitch context ──
+        print('Computing RE24 run-expectancy table from training data...')
+        re24_table = compute_re24_from_pitch_context(train_pc)
+
         # ── Save preprocessed data to cache ──
         if not args.no_cache:
             cache_data = {
@@ -773,6 +779,7 @@ def main():
                 'pitch_mean': pitch_mean,
                 'pitch_std': pitch_std,
                 'context_dim': context_dim,
+                're24_table': re24_table,
             }
             save_preprocessed_data(args.cache_dir, cache_data)
 
@@ -947,6 +954,7 @@ def main():
                 simulator=simulator,
                 lambda_cal=args.lambda_cal,
                 temperature=args.temperature,
+                re24_table=re24_table,
             )
             chain_result = sampler.run_chain(
                 n_steps=args.mcmc_steps,
