@@ -171,7 +171,12 @@ class MHGameSampler:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_chain(self, n_steps: int, burn_in: int = 100) -> dict:
+    def run_chain(
+        self,
+        n_steps: int,
+        burn_in: int = 100,
+        return_trajectories: bool = False,
+    ) -> dict:
         """Run the MH chain for (burn_in + n_steps) iterations.
 
         The first burn_in iterations are discarded to allow the chain to reach
@@ -179,19 +184,25 @@ class MHGameSampler:
         n_steps samples.
 
         Args:
-            n_steps:  Number of post-burn-in samples to collect.
-            burn_in:  Number of initial steps to discard.
+            n_steps:              Number of post-burn-in samples to collect.
+            burn_in:              Number of initial steps to discard.
+            return_trajectories:  If True, include the full list of post-burn-in
+                                  GameTrajectory objects in the result dict. Useful
+                                  for diagnostics and visualization.
 
         Returns:
             A dict with:
-              - win_probability (float): estimated P(home team wins).
-              - acceptance_rate (float): fraction of post-burn-in proposals accepted.
-              - n_samples       (int):   number of post-burn-in samples (= n_steps).
+              - win_probability  (float):           estimated P(home team wins).
+              - acceptance_rate  (float):           fraction of post-burn-in proposals accepted.
+              - n_samples        (int):             number of post-burn-in samples (= n_steps).
+              - win_samples      (List[float]):     per-step home win indicator (0/1).
+              - trajectories     (List[GameTrajectory]): only present when return_trajectories=True.
         """
         current = self._simulate_full_game()
 
         n_accepted = 0
         win_samples: List[float] = []
+        trajectories: List[GameTrajectory] = []
 
         for step in range(burn_in + n_steps):
             proposed, split_k = self._propose(current)
@@ -211,15 +222,21 @@ class MHGameSampler:
 
             if step >= burn_in:
                 win_samples.append(float(current.home_wins))
+                if return_trajectories:
+                    trajectories.append(current)
 
         acceptance_rate = n_accepted / n_steps if n_steps > 0 else 0.0
         win_probability = float(np.mean(win_samples)) if win_samples else 0.5
 
-        return {
+        result = {
             "win_probability": win_probability,
             "acceptance_rate": acceptance_rate,
             "n_samples": len(win_samples),
+            "win_samples": win_samples,
         }
+        if return_trajectories:
+            result["trajectories"] = trajectories
+        return result
 
     # ------------------------------------------------------------------
     # Proposal
