@@ -584,3 +584,31 @@ def get_transformed_data(start_dt, end_dt, weather = True, weather_api_key='VQVK
     }
 
     return res_dict
+
+
+def get_game_final_scores(start_dt, end_dt):
+    """
+    Get the final score of each game in the given date range.
+
+    Parameters:
+    - start_dt: Start date string (e.g. '2024-05-01')
+    - end_dt:   End date string (e.g. '2024-10-01')
+
+    Returns:
+    - DataFrame with columns: game_date, home_team, away_team, home_score, away_score, home_win
+    """
+    df = statcast(start_dt=start_dt, end_dt=end_dt)
+    df = df.sort_values(['game_date', 'home_team', 'at_bat_number', 'pitch_number'])
+
+    # Take the last pitch of each game to get the final score
+    final = (
+        df.groupby(['game_date', 'home_team', 'away_team'])
+        .agg(
+            home_score=('home_score', 'last'),
+            away_score=('away_score', 'last'),
+        )
+        .reset_index()
+    )
+    final['home_win'] = (final['home_score'] > final['away_score']).astype(int)
+    final['game_date'] = pd.to_datetime(final['game_date'])
+    return final

@@ -706,7 +706,7 @@ class GaussianDiffusion1D(nn.Module):
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, t, self_cond, cond=cond)
 
-        img = unnormalize_to_zero_to_one(img)
+        # Skip unnormalize — input was z-scored, not [0,1]
         return img
 
     @torch.no_grad()
@@ -742,7 +742,7 @@ class GaussianDiffusion1D(nn.Module):
                   c * pred_noise + \
                   sigma * noise
 
-        img = unnormalize_to_zero_to_one(img)
+        # Skip unnormalize — input was z-scored, not [0,1]
         return img
 
     @torch.no_grad()
@@ -785,7 +785,7 @@ class GaussianDiffusion1D(nn.Module):
             raise ValueError(f'invalid loss type {self.loss_type}')
 
 
-    def p_losses(self, x_start, t, noise = None, cond = None):
+    def p_losses(self, x_start, t, noise = None, cond = None, seq_mask = None):
         b, c, n = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -820,9 +820,18 @@ class GaussianDiffusion1D(nn.Module):
             raise ValueError(f'unknown objective {self.objective}')
 
         loss = self.loss_fn(model_out, target, reduction = 'none')
+        # loss shape: (B, C, N) where C = channels, N = seq_length
+        n_channels = loss.shape[1]
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
+
+        # Mask out padded positions if seq_mask is provided
+        if seq_mask is not None:
+            # seq_mask: (B, N) → expand to (B, C*N) to match flattened loss
+            mask_expanded = seq_mask.float().unsqueeze(1).expand(-1, n_channels, -1).reshape(loss.shape)
+            loss = loss * mask_expanded
+            return loss.sum() / mask_expanded.sum().clamp(min=1)
         return loss.mean()
 
     def forward(self, img, *args, **kwargs):
@@ -830,7 +839,7 @@ class GaussianDiffusion1D(nn.Module):
         assert n == seq_length, f'seq length must be {seq_length}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = normalize_to_neg_one_to_one(img)
-        
-        # print(f'shape after normalizing: {img.shape}')
+        # NOTE: skip normalize_to_neg_one_to_one — our input is z-scored
+        # (centered ~0, std ~1), not in [0,1]. The original transform (x*2-1)
+        # would distort z-scored data and push values far outside [-1,1].
         return self.p_losses(img, t, *args, **kwargs)

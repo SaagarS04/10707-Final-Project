@@ -8,7 +8,7 @@ baselines.
 Baselines:
   1. Historical average:  always predict training-set home win rate
   2. Log5 method:         p = (h - h·a) / (h + a - 2·h·a)
-  3. Logistic regression  on game-context features
+  3. MLP classifier       on game-context + prefix-state features
 
 Metrics:  Brier score · Log-loss · Accuracy · Calibration
 
@@ -48,9 +48,9 @@ from mcmc_simulator import MHGameSampler
 from pitch_data import compute_re24_from_pitch_context
 from pitch_sequence_predictor import (
     PitchSequenceTransfusion,
-    AtBatSequenceDataset,
+    GameSequenceDataset,
     GameSimulator,
-    collate_at_bats,
+    collate_games,
     train_model,
     load_data,
     prepare_game_context,
@@ -169,6 +169,111 @@ def _apply_event(event, outs, b0, b1, b2):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Extract real game state at the start of a given inning (or half-inning)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_game_state_at_inning(game_id, start_inning, test_pitch, test_pc, test_pr, test_ab,
+                                  pt_to_idx, pr_to_idx, ev_to_idx, zone_to_idx,
+                                  pitch_mean, pitch_std):
+    """
+    Find the game state just before `start_inning` begins.
+
+    Args:
+        start_inning: float — the inning to start simulating FROM.
+            Whole numbers (e.g. 8) → top of that inning (use innings 1-7 fully).
+            Half values  (e.g. 7.5) → bottom of that inning (use through top of 7).
+            1.0 → simulate from scratch.
+
+    Returns:
+        dict with keys: inning, is_top, outs, home_score, away_score,
+                        bases (list of 3 bools), balls, strikes,
+                        n_pitches_replayed (int), total_pitches (int)
+        or None if the game can't be found
+    """
+    # Determine the integer inning and whether we start at bottom half
+    is_half = (start_inning % 1) >= 0.4   # 7.5 → True, 8.0 → False
+    base_inning = int(start_inning)        # 7.5 → 7, 8.0 → 8
+
+    if start_inning <= 1.0:
+        mask = test_pitch['game_id'] == game_id
+        total = mask.sum()
+        return {
+            'inning': 1, 'is_top': True, 'outs': 0,
+            'home_score': 0, 'away_score': 0,
+            'bases': [False, False, False],
+            'balls': 0, 'strikes': 0,
+            'n_pitches_replayed': 0, 'total_pitches': total,
+        }
+
+    # Get all pitches for this game
+    mask = test_pitch['game_id'] == game_id
+    if mask.sum() == 0:
+        return None
+
+    game_pitches = test_pitch[mask].copy()
+    game_pc = test_pc[mask].copy()
+
+    # Sort by chronological pitch order
+    game_pitches = game_pitches.sort_values(['at_bat_id', 'pitch_id'])
+    sort_idx = game_pitches.index
+    game_pc = game_pc.loc[sort_idx].reset_index(drop=True)
+    game_pitches = game_pitches.reset_index(drop=True)
+
+    total_pitches = len(game_pitches)
+
+    innings = game_pc['inning'].values
+    topbot  = game_pc['inning_topbot_Top'].values   # 1 = top, 0 = bottom
+
+    if is_half:
+        # e.g. 7.5 → use all of top of inning 7 (and everything before).
+        # Start simulating from bottom of inning 7.
+        # Prefix = pitches where (inning < base_inning) OR (inning == base_inning AND is_top)
+        prefix_mask = (innings < base_inning) | ((innings == base_inning) & (topbot == 1))
+        result_inning = base_inning
+        result_is_top = False
+    else:
+        # e.g. 8 → use all of inning 7 (top + bottom). Start from top of 8.
+        # Prefix = pitches where inning < base_inning
+        prefix_mask = innings < base_inning
+        result_inning = base_inning
+        result_is_top = True
+
+    n_prefix = int(prefix_mask.sum())
+
+    if n_prefix == 0:
+        return {
+            'inning': 1, 'is_top': True, 'outs': 0,
+            'home_score': 0, 'away_score': 0,
+            'bases': [False, False, False],
+            'balls': 0, 'strikes': 0,
+            'n_pitches_replayed': 0, 'total_pitches': total_pitches,
+        }
+
+    if n_prefix >= total_pitches:
+        n_prefix = total_pitches
+
+    # Get the score from the FIRST pitch AFTER the prefix (cleanest boundary).
+    # If that pitch doesn't exist, use the last prefix pitch.
+    non_prefix_mask = ~prefix_mask
+    if non_prefix_mask.any():
+        first_after = np.where(non_prefix_mask)[0][0]
+        row = game_pc.iloc[first_after]
+    else:
+        row = game_pc.iloc[n_prefix - 1]
+
+    home_score = int(row.get('home_score', 0))
+    away_score = int(row.get('away_score', 0))
+
+    return {
+        'inning': result_inning, 'is_top': result_is_top, 'outs': 0,
+        'home_score': home_score, 'away_score': away_score,
+        'bases': [False, False, False],
+        'balls': 0, 'strikes': 0,
+        'n_pitches_replayed': n_prefix, 'total_pitches': total_pitches,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Batched Game Simulation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -181,9 +286,13 @@ def simulate_games_batched(
     temperature=1.0,
     forward_chunk=2048,
     max_game_pitches=1200,
+    init_state=None,    # dict with initial game state from prefix replay (or None)
 ):
     """
     Simulate *N* complete baseball games for a single game context.
+
+    If init_state is provided, all N simulations start from that game state
+    (inning, score, outs, bases, count) rather than from the beginning.
 
     All N simulations share the same static context but diverge via stochastic
     sampling.  The expensive forward passes are batched; per-simulation state
@@ -200,14 +309,24 @@ def simulate_games_batched(
     MAX_AB     = 30            # max pitches per at-bat (safety cap)
 
     # ── state arrays (N,) ──
-    inning     = np.ones(N, dtype=np.int32)
-    is_top     = np.ones(N, dtype=bool)          # True → away batting
-    outs       = np.zeros(N, dtype=np.int32)
-    bases      = np.zeros((N, 3), dtype=bool)    # columns: 1B 2B 3B
-    home_score = np.zeros(N, dtype=np.int32)
-    away_score = np.zeros(N, dtype=np.int32)
-    balls      = np.zeros(N, dtype=np.int32)
-    strikes    = np.zeros(N, dtype=np.int32)
+    if init_state is not None:
+        inning     = np.full(N, init_state['inning'], dtype=np.int32)
+        is_top     = np.full(N, init_state['is_top'], dtype=bool)
+        outs       = np.full(N, init_state['outs'], dtype=np.int32)
+        bases      = np.tile(np.array(init_state['bases'], dtype=bool), (N, 1))
+        home_score = np.full(N, init_state['home_score'], dtype=np.int32)
+        away_score = np.full(N, init_state['away_score'], dtype=np.int32)
+        balls      = np.full(N, init_state['balls'], dtype=np.int32)
+        strikes    = np.full(N, init_state['strikes'], dtype=np.int32)
+    else:
+        inning     = np.ones(N, dtype=np.int32)
+        is_top     = np.ones(N, dtype=bool)          # True → away batting
+        outs       = np.zeros(N, dtype=np.int32)
+        bases      = np.zeros((N, 3), dtype=bool)    # columns: 1B 2B 3B
+        home_score = np.zeros(N, dtype=np.int32)
+        away_score = np.zeros(N, dtype=np.int32)
+        balls      = np.zeros(N, dtype=np.int32)
+        strikes    = np.zeros(N, dtype=np.int32)
     game_over  = np.zeros(N, dtype=bool)
 
     # ── per-sim at-bat history buffers ──
@@ -447,25 +566,59 @@ def log5(h, a):
     return (h - h * a) / denom
 
 
-def logistic_baseline(train_gc, train_gt, test_gc, ctx_columns, ctx_mean, ctx_std):
-    """Train a logistic regression on game-context features → home_win."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
+def mlp_baseline(train_gc, train_gt, test_gc, ctx_columns, ctx_mean, ctx_std,
+                 test_prefix_states=None, eval_idx=None):
+    """Train an MLP classifier on game-context features → home_win.
+
+    When test_prefix_states is provided (list-of-dicts parallel to eval_idx),
+    the prefix game-state is appended as extra features for the test rows that
+    are actually evaluated.  Training data always has prefix features set to
+    the start-of-game defaults (zeros) so the model learns how to use them.
+    """
+    from sklearn.neural_network import MLPClassifier
+
+    PREFIX_COLS = ['inning', 'is_top', 'outs', 'home_score', 'away_score',
+                   'on_1b', 'on_2b', 'on_3b', 'balls', 'strikes']
+    n_prefix = len(PREFIX_COLS)
 
     # Prepare train features
     X_train = train_gc[ctx_columns].values.astype(np.float64)
     X_train = (X_train - ctx_mean) / ctx_std
     y_train = train_gt['home_win_exp'].values
 
+    # Append start-of-game prefix features for training (all zeros / defaults)
+    prefix_train = np.zeros((len(X_train), n_prefix), dtype=np.float64)
+    prefix_train[:, 0] = 1.0   # inning = 1
+    prefix_train[:, 1] = 1.0   # is_top = True
+    X_train = np.hstack([X_train, prefix_train])
+
     # Prepare test features
     X_test = test_gc.reindex(columns=ctx_columns, fill_value=0).values.astype(np.float64)
     X_test = (X_test - ctx_mean) / ctx_std
+
+    # Build prefix features for test set
+    prefix_test = np.zeros((len(X_test), n_prefix), dtype=np.float64)
+    prefix_test[:, 0] = 1.0   # default inning
+    prefix_test[:, 1] = 1.0   # default is_top
+    if test_prefix_states is not None and eval_idx is not None:
+        for j, gi in enumerate(eval_idx):
+            st = test_prefix_states[j]
+            if st is not None:
+                prefix_test[gi] = [
+                    st['inning'], float(st['is_top']), st['outs'],
+                    st['home_score'], st['away_score'],
+                    float(st['bases'][0]), float(st['bases'][1]), float(st['bases'][2]),
+                    st['balls'], st['strikes'],
+                ]
+    X_test = np.hstack([X_test, prefix_test])
 
     # Handle NaN
     X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
     X_test  = np.nan_to_num(X_test,  nan=0.0, posinf=0.0, neginf=0.0)
 
-    model = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs')
+    model = MLPClassifier(hidden_layer_sizes=(1000, 1000, 1000), max_iter=500,
+                          early_stopping=True, validation_fraction=0.1,
+                          random_state=42)
     model.fit(X_train, y_train)
 
     probs = model.predict_proba(X_test)[:, 1]
@@ -517,11 +670,11 @@ def parse_args():
     p.add_argument('--train', action='store_true', help='Train model before evaluating')
     p.add_argument('--epochs', type=int, default=100)
     p.add_argument('--batch_size', type=int, default=256)
-    p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--n_sims', type=int, default=5000, help='Simulations per game')
+    p.add_argument('--lr', type=float, default=5e-4)
+    p.add_argument('--n_sims', type=int, default=10, help='Simulations per game')
     p.add_argument('--n_games', type=int, default=0,
                    help='Number of test games to evaluate (0 = all)')
-    p.add_argument('--temperature', type=float, default=3)
+    p.add_argument('--temperature', type=float, default=1)
     p.add_argument('--forward_chunk', type=int, default=256,
                    help='Max batch size for model forward pass')
     p.add_argument('--n_threads', type=int, default=12,
@@ -532,12 +685,15 @@ def parse_args():
                    help='Disable caching (always reprocess data)')    
     p.add_argument('--ddpm_steps', type=int, default=20,
                    help='DDIM sampling steps for continuous features (fewer=faster)')
-    p.add_argument('--d_model', type=int, default=256, help='Transformer hidden dim')
-    p.add_argument('--n_layers', type=int, default=8, help='Transformer layers')
-    p.add_argument('--n_heads', type=int, default=8, help='Attention heads')
+    p.add_argument('--d_model', type=int, default=8, help='Transformer hidden dim')
+    p.add_argument('--n_layers', type=int, default=2, help='Transformer layers')
+    p.add_argument('--n_heads', type=int, default=2, help='Attention heads')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--train_pct', type=float, default=1)
     p.add_argument('--test_pct', type=float, default=1)
+    p.add_argument('--prefix_inning', type=float, default=1.0,
+                   help='Inning to start simulating from (1 = from scratch, '
+                        '8 = use innings 1-7 as context, 7.5 = use through top of 7)')
     # MCMC options
     p.add_argument('--mcmc', action='store_true',
                    help='Use Metropolis-Hastings MCMC instead of batched Monte Carlo')
@@ -557,7 +713,8 @@ def simulate_single_game(args_tuple):
     """
     (j, gi, model, test_gc_features, ctx_mean, ctx_std, n_sims, 
      device, idx_to_ev, temperature, forward_chunk, test_game_ids, 
-     progress_counter, progress_lock, n_eval, t0, actuals, log5_probs) = args_tuple
+     progress_counter, progress_lock, n_eval, t0, actuals, log5_probs,
+     init_state) = args_tuple
     
     try:
         # Prepare context
@@ -569,6 +726,7 @@ def simulate_single_game(args_tuple):
             idx_to_ev=idx_to_ev,
             temperature=temperature,
             forward_chunk=forward_chunk,
+            init_state=init_state,
         )
         
         mc_prob = result['home_wins'] / n_sims
@@ -731,7 +889,7 @@ def main():
         test_gc_features = pd.get_dummies(test_gc_features, drop_first=True).astype(float)
         test_gc_features = test_gc_features.reindex(columns=ctx_columns, fill_value=0)
 
-        # Also need train features for logistic regression (before normalization)
+        # Also need train features for MLP baseline (before normalization)
         train_gc_features = train_gc_proc.drop(columns=['game_id'], errors='ignore')
 
         # Continuous pitch normalisation
@@ -797,40 +955,63 @@ def main():
         if test_game_ids is not None:
             test_gc_with_id['game_id'] = test_game_ids
 
-        n = int(len(train_pitch) * args.train_pct)
-        train_pitch = train_pitch[-n:]
-        train_pc = train_pc[-n:]
-        train_pr = train_pr[-n:]
-        train_ab = train_ab[-n:]
+        # Subset by game (not pitch) so we don't split mid-game
+        if args.train_pct < 1.0:
+            all_game_ids = train_pitch['game_id'].unique()
+            n_games = max(1, int(len(all_game_ids) * args.train_pct))
+            keep_games = set(all_game_ids[-n_games:])
+            mask = train_pitch['game_id'].isin(keep_games)
+            train_pitch = train_pitch[mask].reset_index(drop=True)
+            train_pc = train_pc[mask].reset_index(drop=True)
+            train_pr = train_pr[mask].reset_index(drop=True)
+            train_ab = train_ab[mask].reset_index(drop=True)
 
-        m = int(len(train_pitch) * args.test_pct)
-        test_pitch = test_pitch[-m:]
-        test_pc = test_pc[-m:]
-        test_pr = test_pr[-m:]
-        test_ab = test_ab[-m:]
+        if args.test_pct < 1.0:
+            all_test_ids = test_pitch['game_id'].unique()
+            m_games = max(1, int(len(all_test_ids) * args.test_pct))
+            keep_test = set(all_test_ids[-m_games:])
+            mask = test_pitch['game_id'].isin(keep_test)
+            test_pitch = test_pitch[mask].reset_index(drop=True)
+            test_pc = test_pc[mask].reset_index(drop=True)
+            test_pr = test_pr[mask].reset_index(drop=True)
+            test_ab = test_ab[mask].reset_index(drop=True)
 
-        train_dataset = AtBatSequenceDataset(
+        # Print date ranges and pitch counts
+        if 'game_date' in train_pitch.columns:
+            print(f'  Train date range: {train_pitch["game_date"].min()} to {train_pitch["game_date"].max()}')
+        if 'game_date' in test_pitch.columns:
+            print(f'  Test  date range: {test_pitch["game_date"].min()} to {test_pitch["game_date"].max()}')
+        print(f'  Train pitches: {len(train_pitch):,}')
+        print(f'  Test  pitches: {len(test_pitch):,}')
+
+        train_dataset = GameSequenceDataset(
             train_pitch, train_pc, train_pr, train_ab, train_gc_with_id,
             pt_to_idx, pr_to_idx, ev_to_idx, zone_to_idx,
             ctx_columns, ctx_mean, ctx_std, pitch_mean, pitch_std,
+            max_pitches=352,
         )
-        test_dataset = AtBatSequenceDataset(
+        test_dataset = GameSequenceDataset(
             test_pitch, test_pc, test_pr, test_ab, test_gc_with_id,
             pt_to_idx, pr_to_idx, ev_to_idx, zone_to_idx,
             ctx_columns, ctx_mean, ctx_std, pitch_mean, pitch_std,
+            max_pitches=352,
         )
-        print(f'  Train: {len(train_dataset)} at-bats, Test: {len(test_dataset)} at-bats')
+        n_games_train = len(train_dataset) // len(GameSequenceDataset.INNING_CHOICES)
+        n_games_test = len(test_dataset) // len(GameSequenceDataset.INNING_CHOICES)
+        print(f'  Train: {len(train_dataset)} samples ({n_games_train} games x {len(GameSequenceDataset.INNING_CHOICES)} inning cuts)')
+        print(f'  Test:  {len(test_dataset)} samples ({n_games_test} games x {len(GameSequenceDataset.INNING_CHOICES)} inning cuts)')
 
         model = PitchSequenceTransfusion(
             context_dim=context_dim, d_model=args.d_model, n_heads=args.n_heads,
-            n_layers=args.n_layers, dropout=0.1, max_seq_len=256,
+            n_layers=args.n_layers, dropout=0, max_seq_len=352,
         )
         print(f'  Parameters: {sum(p.numel() for p in model.parameters()):,}')
 
         model = train_model(
             model, train_dataset, test_dataset,
-            epochs=args.epochs, batch_size=args.batch_size,
-            lr=args.lr, lambda_continuous=5.0,
+            epochs=args.epochs, batch_size=32,
+            lr=args.lr, lambda_continuous=1.0,
+            collate_fn=collate_games,
         )
 
         torch.save({
@@ -866,7 +1047,7 @@ def main():
         n_heads = ckpt.get('n_heads', args.n_heads)
         model = PitchSequenceTransfusion(
             context_dim=context_dim, d_model=d_model, n_heads=n_heads,
-            n_layers=n_layers, dropout=0.25, max_seq_len=256,
+            n_layers=n_layers, dropout=0.1, max_seq_len=352,
         )
         model.load_state_dict(ckpt['model_state_dict'])
 
@@ -904,18 +1085,43 @@ def main():
         if pd.isna(a) or a == 0: a = 0.5
         log5_probs[j] = log5(h, a)
 
-    # Logistic regression
+    # Compute true final scores for eval games (max score seen across all pitches)
+    true_home_scores = np.zeros(n_eval)
+    true_away_scores = np.zeros(n_eval)
+    for j, gi in enumerate(eval_idx):
+        game_id = test_game_ids[gi] if test_game_ids is not None else gi
+        gm = test_pitch['game_id'] == game_id
+        if gm.any():
+            true_home_scores[j] = test_pc.loc[gm, 'home_score'].max()
+            true_away_scores[j] = test_pc.loc[gm, 'away_score'].max()
+
+    # Pre-compute prefix states for eval games (used by both MLP baseline and MC sim)
+    prefix_states = [None] * n_eval
+    if args.prefix_inning > 1:
+        print(f'  Extracting prefix states (sim from inning {args.prefix_inning})...')
+        for j, gi in enumerate(eval_idx):
+            game_id = test_game_ids[gi] if test_game_ids is not None else gi
+            prefix_states[j] = extract_game_state_at_inning(
+                game_id, args.prefix_inning,
+                test_pitch, test_pc, test_pr, test_ab,
+                pt_to_idx, pr_to_idx, ev_to_idx, zone_to_idx,
+                pitch_mean, pitch_std,
+            )
+
+    # MLP classifier
     try:
-        lr_probs_all, lr_model = logistic_baseline(
+        mlp_probs_all, mlp_model = mlp_baseline(
             train_gc_features, train_gt, test_gc_features,
             ctx_columns, ctx_mean, ctx_std,
+            test_prefix_states=prefix_states if args.prefix_inning > 1 else None,
+            eval_idx=eval_idx,
         )
-        lr_probs = lr_probs_all[eval_idx]
-        have_lr = True
+        mlp_probs = mlp_probs_all[eval_idx]
+        have_mlp = True
     except Exception as e:
-        print(f'  Logistic regression failed: {e}')
-        lr_probs = np.full(n_eval, hist_rate)
-        have_lr = False
+        print(f'  MLP classifier failed: {e}')
+        mlp_probs = np.full(n_eval, hist_rate)
+        have_mlp = False
 
     # ── Simulation (MC or MCMC) ──
     use_mcmc = getattr(args, 'mcmc', False)
@@ -984,11 +1190,15 @@ def main():
             ctx_normed = (ctx_row - ctx_mean) / ctx_std
             ctx_normed = np.nan_to_num(ctx_normed, nan=0.0)
 
+            # Use pre-computed prefix state
+            init_state = prefix_states[j]
+
             result = simulate_games_batched(
                 model, ctx_normed, args.n_sims, device,
                 idx_to_ev=idx_to_ev,
                 temperature=args.temperature,
                 forward_chunk=args.forward_chunk,
+                init_state=init_state,
             )
             mc_probs[j]  = result['home_wins'] / args.n_sims
             mc_avg_hs[j] = result['home_scores'].mean()
@@ -1009,9 +1219,12 @@ def main():
         # Prepare arguments for worker threads
         thread_args = []
         for j, gi in enumerate(eval_idx):
+            # Use pre-computed prefix state
+            init_state = prefix_states[j]
             args_tuple = (j, gi, model, test_gc_features, ctx_mean, ctx_std, args.n_sims,
                          device, idx_to_ev, args.temperature, args.forward_chunk, test_game_ids,
-                         progress_counter, progress_lock, n_eval, t0, actuals, log5_probs)
+                         progress_counter, progress_lock, n_eval, t0, actuals, log5_probs,
+                         init_state)
             thread_args.append(args_tuple)
 
         # Execute simulations in parallel
@@ -1041,8 +1254,8 @@ def main():
         'Historical avg': hist_probs,
         'Log5':           log5_probs,
     }
-    if have_lr:
-        methods['Logistic reg'] = lr_probs
+    if have_mlp:
+        methods['MLP classifier'] = mlp_probs
     sim_method_label = 'MCMC (MH)' if use_mcmc else 'MC simulation'
     methods[sim_method_label] = mc_probs
 
@@ -1071,18 +1284,26 @@ def main():
         print(f'  Avg away score: {mc_avg_as.mean():.2f} ± {mc_avg_as.std():.2f}')
 
     # Save results
+    prefix_home = np.array([ps['home_score'] if ps else 0 for ps in prefix_states])
+    prefix_away = np.array([ps['away_score'] if ps else 0 for ps in prefix_states])
+
     results_df = pd.DataFrame({
         'game_idx': eval_idx,
         'game_id': [test_game_ids[i] if test_game_ids is not None else i for i in eval_idx],
         'actual': actuals,
         'mc_prob': mc_probs,
         'log5_prob': log5_probs,
-        'lr_prob': lr_probs if have_lr else hist_rate,
+        'mlp_prob': mlp_probs if have_mlp else hist_rate,
         'hist_prob': hist_rate,
         'mc_avg_home': mc_avg_hs,
         'mc_avg_away': mc_avg_as,
+        'true_home_score': true_home_scores.astype(int),
+        'true_away_score': true_away_scores.astype(int),
+        'prefix_home_score': prefix_home.astype(int),
+        'prefix_away_score': prefix_away.astype(int),
     })
-    out_path = f'win_prob_results_{n_eval}games_{args.n_sims}sims.csv'
+    prefix_tag = f'_frominn{args.prefix_inning}' if args.prefix_inning > 1 else ''
+    out_path = f'win_prob_results_{n_eval}games_{args.n_sims}sims{prefix_tag}.csv'
     results_df.to_csv(out_path, index=False)
     print(f'\nResults saved to {out_path}')
 
