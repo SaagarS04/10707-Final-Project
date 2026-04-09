@@ -186,7 +186,7 @@ def _build_observed_half_innings(game_df, context_end_idx: int) -> list:
     prefix = game_df.iloc[:context_end_idx]
 
     # Group by (inning, is_top) to get completed half-innings.
-    for (inning, is_top_flag), group in prefix.groupby(["inning", "top_bottom_flag"], sort=True):
+    for (inning, is_top_flag), group in prefix.groupby(["inning", "inning_topbot"], sort=True):
         is_top = bool(is_top_flag == "Top")
         # Runs = score change for the batting team over this half-inning.
         if len(group) == 0:

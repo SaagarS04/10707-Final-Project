@@ -149,10 +149,17 @@ class TransFusionSimulator:
         self.idx_to_pt = {v: k for k, v in encoders.pitch_type.items()}
         self.idx_to_oc = {v: k for k, v in encoders.outcome.items()}
 
+        # Ensure model is in inference mode (no dropout, no batch-norm updates).
+        self.model.eval()
+
         # Fixed zero tensors for batter ctx (league-average from scaler means)
         batter_feat_dim = model.cfg.batter_feat_dim
         self._b_ctx_zero  = torch.zeros(1, batter_feat_dim, device=self.device)
         self._bid_zero    = torch.zeros(1, dtype=torch.long, device=self.device)
+
+        # Pre-allocated index tensors reused across pitches to avoid per-pitch allocation.
+        self._pt_tok = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._oc_tok = torch.zeros(1, dtype=torch.long, device=self.device)
 
         # Encode and cache the initial context vector (pregame or live-prefix boundary)
         self._initial_ctx = self._encode_initial_context()
@@ -369,8 +376,10 @@ class TransFusionSimulator:
             pt_str = self.idx_to_pt.get(pt_idx, "FF")
             oc_str = self.idx_to_oc.get(oc_idx, "ball")
 
-            pt_tok = torch.tensor([pt_idx], dtype=torch.long,  device=self.device)
-            oc_tok = torch.tensor([oc_idx], dtype=torch.long,  device=self.device)
+            self._pt_tok.fill_(pt_idx)
+            self._oc_tok.fill_(oc_idx)
+            pt_tok = self._pt_tok
+            oc_tok = self._oc_tok
 
             # ── Step 2: sample continuous pitch features (DDIM) ───────────
             with torch.no_grad():
