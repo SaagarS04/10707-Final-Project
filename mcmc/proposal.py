@@ -231,4 +231,8 @@ def _state_at_boundary(
         bases=[False, False, False],
         observed_prefix_length=original_state.observed_prefix_length,
         completed_half_innings=list(prefix_half_innings),
+        # Propagate cached context vectors up to (but not including) split_k.
+        # TransFusionSimulator reads ctx_vecs_at_boundaries[-1] as the starting
+        # context for the resimulated suffix.  GameSimulator ignores this field.
+        ctx_vecs_at_boundaries=list(original_state.ctx_vecs_at_boundaries[:split_k]),
     )

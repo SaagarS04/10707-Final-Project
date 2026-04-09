@@ -121,6 +121,11 @@ class GameState:
     current_ab_history: list[PitchEvent] = field(default_factory=list)
     observed_prefix_length: int = 0
     completed_half_innings: list[HalfInning] = field(default_factory=list)
+    # Context vectors at each half-inning boundary, parallel to completed_half_innings.
+    # ctx_vecs_at_boundaries[i] is the model context vector after completing half-inning i.
+    # Used by TransFusionSimulator so MCMC proposals can resimulate from any split point
+    # without re-encoding the full prefix.  Empty list for GameSimulator (constant context).
+    ctx_vecs_at_boundaries: list = field(default_factory=list)
 
     @property
     def n_half_innings(self) -> int:
