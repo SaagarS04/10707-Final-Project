@@ -2,7 +2,6 @@ from pybaseball import statcast, statcast_pitcher, statcast_pitcher_percentile_r
 import pandas as pd
 import numpy as np
 import pybaseball
-from weather_utils import add_weather_to_games
 from tqdm import tqdm
 
 import warnings

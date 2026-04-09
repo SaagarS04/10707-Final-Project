@@ -828,6 +828,8 @@ class GaussianDiffusion1D(nn.Module):
 
         # Mask out padded positions if seq_mask is provided
         if seq_mask is not None:
+            assert seq_mask.shape == (x_start.shape[0], x_start.shape[-1]), \
+                f"seq_mask shape {seq_mask.shape} must be (B={x_start.shape[0]}, N={x_start.shape[-1]})"
             # seq_mask: (B, N) → expand to (B, C*N) to match flattened loss
             mask_expanded = seq_mask.float().unsqueeze(1).expand(-1, n_channels, -1).reshape(loss.shape)
             loss = loss * mask_expanded
