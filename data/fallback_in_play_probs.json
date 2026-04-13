@@ -1,0 +1,13 @@
+{
+  "_source": "MLB Statcast 2023 regular season (2023-03-30 to 2023-10-01), computed from 123,116 in-play plate appearances via pybaseball",
+  "single":                       0.211435,
+  "double":                       0.066831,
+  "triple":                       0.005783,
+  "home_run":                     0.047662,
+  "field_out":                    0.589387,
+  "force_out":                    0.029224,
+  "double_play":                  0.003160,
+  "grounded_into_double_play":    0.028063,
+  "field_error":                  0.008659,
+  "sac_fly":                      0.009796
+}

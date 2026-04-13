@@ -49,7 +49,7 @@ from new_transfusion import (
 )
 from new_dataset_builder import BaseballDatasetBuilder
 
-from sim.transfusion_simulator import TransFusionSimulator
+from sim.transfusion_simulator import TransFusionSimulator, _load_in_play_probs
 from mcmc.chain      import MHChain
 from mcmc.energy     import RE24Energy
 from mcmc.proposal   import SuffixResimulation
@@ -241,6 +241,8 @@ def main() -> None:
 
     print(f"[run_mcmc_transfusion] Building dataset from {args.cache_dir}")
     test_ds, encoders, pitch_scaler = _build_dataset(args.cache_dir, cfg.max_seq_len)
+
+    _load_in_play_probs(args.cache_dir)
 
     print(f"[run_mcmc_transfusion] Loading RE24 table from {args.data_dir}")
     re24 = load_re24_dict(args.data_dir)

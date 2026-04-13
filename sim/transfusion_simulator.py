@@ -52,17 +52,51 @@ from new_transfusion import (
 _MAX_INNINGS   = 9
 _MAX_PA_PITCHES = 30  # safety cap on pitches per plate appearance
 
-# Fixed in-play event prior (matches new_transfusion._sample_in_play_event).
+# In-play event prior — loaded from empirical cache at simulator init time.
 _IN_PLAY_EVENTS: list[str] = [
     "single", "double", "triple", "home_run",
     "field_out", "force_out", "double_play",
     "grounded_into_double_play", "field_error", "sac_fly",
 ]
+# Fallback prior used only if the cache file is missing.
 _IN_PLAY_PROBS: np.ndarray = np.array(
     [0.23, 0.06, 0.008, 0.04, 0.45, 0.08, 0.04, 0.03, 0.01, 0.005],
     dtype=np.float64,
 )
 _IN_PLAY_PROBS = _IN_PLAY_PROBS / _IN_PLAY_PROBS.sum()
+
+
+def _load_in_play_probs(cache_dir: str) -> None:
+    """Load empirical in-play event distribution; updates module globals.
+
+    Priority:
+      1. {cache_dir}/in_play_probs.json  — computed from the training split
+      2. data/fallback_in_play_probs.json — MLB Statcast 2023 committed to repo
+      3. Hard-coded round-number prior    — last resort
+    """
+    global _IN_PLAY_PROBS
+    import json, warnings
+    from pathlib import Path
+
+    candidates = [
+        Path(cache_dir) / "in_play_probs.json",
+        Path(__file__).parent.parent / "data" / "fallback_in_play_probs.json",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            with open(path) as f:
+                probs_dict = json.load(f)
+            probs = np.array(
+                [probs_dict.get(e, 0.0) for e in _IN_PLAY_EVENTS], dtype=np.float64
+            )
+            s = probs.sum()
+            if s > 0:
+                probs /= s
+            _IN_PLAY_PROBS = probs
+            return
+
+    warnings.warn("[in-play] No in_play_probs.json found; using hard-coded fallback prior.")
 
 
 # ---------------------------------------------------------------------------
