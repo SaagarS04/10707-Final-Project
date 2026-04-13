@@ -537,41 +537,49 @@ class TransFusion(nn.Module):
 #     State key: (outs, on_1b, on_2b, on_3b) → expected runs
 # =============================================================================
 
-RE24_TABLE: Dict[Tuple[int, bool, bool, bool], float] = {
-    # outs=0
-    (0, False, False, False): 0.481,
-    (0, True,  False, False): 0.859,
-    (0, False, True,  False): 1.100,
-    (0, True,  True,  False): 1.437,
-    (0, False, False, True):  1.350,
-    (0, True,  False, True):  1.784,
-    (0, False, True,  True):  1.926,
-    (0, True,  True,  True):  2.292,
-    # outs=1
-    (1, False, False, False): 0.254,
-    (1, True,  False, False): 0.509,
-    (1, False, True,  False): 0.675,
-    (1, True,  True,  False): 0.884,
-    (1, False, False, True):  0.950,
-    (1, True,  False, True):  1.130,
-    (1, False, True,  True):  1.383,
-    (1, True,  True,  True):  1.591,
-    # outs=2
-    (2, False, False, False): 0.098,
-    (2, True,  False, False): 0.224,
-    (2, False, True,  False): 0.319,
-    (2, True,  True,  False): 0.429,
-    (2, False, False, True):  0.385,
-    (2, True,  False, True):  0.491,
-    (2, False, True,  True):  0.580,
-    (2, True,  True,  True):  0.752,
+# RE24 run-expectancy table — populated at simulation time from empirically
+# computed parquet (see new_dataset_builder.build()).  Fallback values below
+# are sourced from FanGraphs (2014 neutral park, 4.15 R/G environment):
+# https://library.fangraphs.com/misc/re24/
+_RE24_TABLE_CACHE: Dict[Tuple[int, bool, bool, bool], float] = {
+    # (outs, on_1b, on_2b, on_3b): expected runs to end of half-inning
+    (0, False, False, False): 0.461, (0, True,  False, False): 0.831,
+    (0, False, True,  False): 1.068, (0, True,  True,  False): 1.373,
+    (0, False, False, True):  1.426, (0, True,  False, True):  1.798,
+    (0, False, True,  True):  1.920, (0, True,  True,  True):  2.282,
+    (1, False, False, False): 0.243, (1, True,  False, False): 0.489,
+    (1, False, True,  False): 0.644, (1, True,  True,  False): 0.908,
+    (1, False, False, True):  0.865, (1, True,  False, True):  1.140,
+    (1, False, True,  True):  1.352, (1, True,  True,  True):  1.520,
+    (2, False, False, False): 0.095, (2, True,  False, False): 0.214,
+    (2, False, True,  False): 0.305, (2, True,  True,  False): 0.343,
+    (2, False, False, True):  0.413, (2, True,  False, True):  0.471,
+    (2, False, True,  True):  0.570, (2, True,  True,  True):  0.736,
 }
-_RE24_MAX = max(RE24_TABLE.values())  # 2.292
+_RE24_MAX_CACHE: float = 2.282
+
+
+def _load_re24_table(cache_dir: str) -> None:
+    """Load empirical RE24 table from parquet; updates module-level cache."""
+    global _RE24_TABLE_CACHE, _RE24_MAX_CACHE
+    import pandas as _pd
+    path = Path(cache_dir) / "re24_table.parquet"
+    if not path.exists():
+        warnings.warn(f"[re24] re24_table.parquet not found at {path}; using fallback constants.")
+        return
+    df = _pd.read_parquet(str(path))
+    _RE24_TABLE_CACHE = {
+        (int(r.outs), bool(r.on_1b), bool(r.on_2b), bool(r.on_3b)): float(r.re24_value)
+        for _, r in df.iterrows()
+    }
+    _RE24_MAX_CACHE = max(_RE24_TABLE_CACHE.values()) if _RE24_TABLE_CACHE else 2.292
+    print(f"[re24] Loaded empirical RE24 table from {path} (max={_RE24_MAX_CACHE:.3f})")
+
 
 def _phi(outs: int, on_1b: bool, on_2b: bool, on_3b: bool) -> float:
     """Log-normalized RE24 score φ(s) ≤ 0 (eq. 3 in paper)."""
-    re = RE24_TABLE.get((outs, on_1b, on_2b, on_3b), 0.0)
-    return math.log(max(re, 1e-6)) - math.log(_RE24_MAX)
+    re = _RE24_TABLE_CACHE.get((outs, on_1b, on_2b, on_3b), 0.0)
+    return math.log(max(re, 1e-6)) - math.log(_RE24_MAX_CACHE)
 
 
 # =============================================================================
@@ -1143,6 +1151,8 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
         min_pitches_per_game = 100,
     )
     train_ds, val_ds, test_ds, encoders = builder.build()
+    _load_re24_table(cfg_sim.cache_dir)
+    _load_in_play_probs(cfg_sim.cache_dir)
     dataset: PitchSequenceDataset = {"train": train_ds, "val": val_ds,
                                       "test": test_ds}[cfg_sim.split]
 
@@ -1410,6 +1420,7 @@ def simulate_games(cfg_sim: SimConfig, cfg_model: ModelConfig):
         min_pitches_per_game = 100,
     )
     train_ds, val_ds, test_ds, encoders = builder.build()
+    _load_in_play_probs(cfg_sim.cache_dir)
 
     dataset: PitchSequenceDataset = {"train": train_ds, "val": val_ds,
                                       "test": test_ds}[cfg_sim.split]
@@ -1513,11 +1524,46 @@ _IN_PLAY_EVENTS_ARR  = np.array([
     "field_out","force_out","double_play","grounded_into_double_play",
     "field_error","sac_fly",
 ])
-_IN_PLAY_PROBS_ARR = np.array([0.230,0.060,0.008,0.040,
-                                0.450,0.080,0.040,0.030,
-                                0.010,0.005])
+_IN_PLAY_PROBS_ARR = np.array([0.230, 0.060, 0.008, 0.040,
+                                0.450, 0.080, 0.040, 0.030,
+                                0.010, 0.005])
 _IN_PLAY_PROBS_ARR = _IN_PLAY_PROBS_ARR / _IN_PLAY_PROBS_ARR.sum()
 _IN_PLAY_CUMPROBS   = np.cumsum(_IN_PLAY_PROBS_ARR)
+
+
+def _load_in_play_probs(cache_dir: str) -> None:
+    """Load empirical in-play event distribution; updates module-level arrays.
+
+    Priority:
+      1. {cache_dir}/in_play_probs.json  — computed from the training split
+      2. data/fallback_in_play_probs.json — MLB Statcast 2023 committed to repo
+      3. Hard-coded round-number prior    — last resort
+    """
+    global _IN_PLAY_PROBS_ARR, _IN_PLAY_CUMPROBS
+
+    # Candidate paths in priority order
+    candidates = [
+        Path(cache_dir) / "in_play_probs.json",
+        Path(__file__).parent / "data" / "fallback_in_play_probs.json",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            with open(path) as f:
+                probs_dict = json.load(f)
+            # Skip metadata keys (prefixed with "_")
+            probs = np.array(
+                [probs_dict.get(e, 0.0) for e in _IN_PLAY_EVENTS_ARR], dtype=float
+            )
+            s = probs.sum()
+            if s > 0:
+                probs /= s
+            _IN_PLAY_PROBS_ARR = probs
+            _IN_PLAY_CUMPROBS  = np.cumsum(_IN_PLAY_PROBS_ARR)
+            print(f"[in-play] Loaded in-play probs from {path}")
+            return
+
+    warnings.warn("[in-play] No in_play_probs.json found; using hard-coded fallback prior.")
 
 def _vec_sample_in_play(n: int) -> np.ndarray:
     """Sample n in-play events vectorized."""
@@ -1866,17 +1912,6 @@ def _incremental_encode_step(
     new_ctx = enc.step_proj(step_in) + prev_ctx
     return enc.out_norm(new_ctx)
 
-
-def _sample_in_play_event() -> str:
-    in_play_events = {
-        "single": 0.230, "double": 0.060, "triple": 0.008, "home_run": 0.040,
-        "field_out": 0.450, "force_out": 0.080, "double_play": 0.040,
-        "grounded_into_double_play": 0.030, "field_error": 0.010, "sac_fly": 0.005,
-    }
-    events = list(in_play_events.keys())
-    probs  = np.array(list(in_play_events.values()))
-    probs /= probs.sum()
-    return np.random.choice(events, p=probs)
 
 
 def _reconstruct_game_state(game_df, context_end_idx: int) -> GameState:

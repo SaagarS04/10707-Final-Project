@@ -842,6 +842,38 @@ class BaseballDatasetBuilder:
         batter_scaler  = StatScaler().fit(train_batter_stats,  BATTER_STAT_COLS)
         batter_scaler.save(str(self.cache_dir / "batter_scaler.pkl"))
 
+        # 5b. Compute in-play event distribution from training data
+        in_play_cache = self.cache_dir / "in_play_probs.json"
+        if not in_play_cache.exists():
+            print("[builder] Computing in-play event distribution from training data...")
+            terminal = train_df[train_df["events"].notna()].copy()
+            in_play_events = [
+                "single", "double", "triple", "home_run",
+                "field_out", "force_out", "double_play", "grounded_into_double_play",
+                "field_error", "sac_fly",
+            ]
+            counts = terminal["events"].value_counts()
+            probs = {e: float(counts.get(e, 0)) for e in in_play_events}
+            total = sum(probs.values())
+            if total > 0:
+                probs = {k: v / total for k, v in probs.items()}
+            with open(in_play_cache, "w") as f:
+                import json as _json
+                _json.dump(probs, f, indent=2)
+            print(f"[builder] Saved in_play_probs.json: { {k: round(v,4) for k,v in probs.items()} }")
+
+        # 5c. Compute RE24 table from training data
+        re24_cache = self.cache_dir / "re24_table.parquet"
+        if not re24_cache.exists():
+            try:
+                from data.tables import compute_re24_table
+                print("[builder] Computing RE24 table from training data...")
+                re24_df = compute_re24_table(train_df)
+                re24_df.to_parquet(str(re24_cache), index=False)
+                print("[builder] Saved re24_table.parquet")
+            except Exception as e:
+                print(f"[builder] RE24 computation failed ({e}); skipping cache.")
+
         # 6. Group pitches by game
         print("[builder] Grouping pitches by game...")
         all_groups = {}
