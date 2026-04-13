@@ -287,6 +287,8 @@ def aggregate_batter_stats(df: pd.DataFrame) -> pd.DataFrame:
 
     d["launch_speed_num"] = pd.to_numeric(d["launch_speed"], errors="coerce")
     d["is_hard_hit"] = (d["launch_speed_num"] >= 95).astype(float)
+    # is_bip: True whenever launch_speed is non-null (i.e. a batted ball)
+    d["is_bip"] = d["launch_speed_num"].notna().astype(float)
 
     hc_x = pd.to_numeric(d.get("hc_x", pd.Series(np.nan, index=d.index)), errors="coerce")
     stand = d.get("stand", pd.Series("R", index=d.index))
@@ -316,8 +318,10 @@ def aggregate_batter_stats(df: pd.DataFrame) -> pd.DataFrame:
     agg["b_bb_rate"]         = _safe_rate(g["is_bb"].sum(),      total_pa)
     agg["b_hr_rate"]         = _safe_rate(g["is_hr"].sum(),      total_pa)
     agg["b_whiff_rate"]      = _safe_rate(g["is_whiff"].sum(),   total_pitches)
-    agg["b_hard_hit_rate"]   = _safe_rate(g["is_hard_hit"].sum(),total_pitches)
-    agg["b_pull_rate"]       = _safe_rate(g["is_pull"].sum(),    total_pitches)
+    # Hard hit rate and pull rate are per batted ball, not per total pitch
+    total_bip = g["is_bip"].sum()
+    agg["b_hard_hit_rate"]   = _safe_rate(g["is_hard_hit"].sum(), total_bip)
+    agg["b_pull_rate"]       = _safe_rate(g["is_pull"].sum(),     total_bip)
     agg["b_zone_swing_rate"] = _safe_rate(g["zone_swing"].sum(), total_in_zone)
     agg["b_chase_rate"]      = _safe_rate(g["chase_swing"].sum(),total_oozone)
     agg["b_contact_rate"]    = _safe_rate(
@@ -344,7 +348,7 @@ def preprocess_statcast(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
     for col in ["on_1b", "on_2b", "on_3b"]:
-        df[col] = df[col].notna().astype(float)
+        df[col] = df[col].fillna(0).apply(lambda x: 0.0 if x == 0 else 1.0)
 
     for col in ["balls", "strikes", "outs_when_up", "inning"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -355,6 +359,16 @@ def preprocess_statcast(df: pd.DataFrame) -> pd.DataFrame:
 
     df["batter"]  = pd.to_numeric(df["batter"],  errors="coerce")
     df["pitcher"] = pd.to_numeric(df["pitcher"], errors="coerce")
+
+    # Some pybaseball versions forward-fill events across all pitches of a PA.
+    # Null out events on non-terminal pitches so only the last pitch of each
+    # at-bat carries the terminal event — fixing the 26% terminal rate.
+    last_pitch_idx = (
+        df.groupby(["game_pk", "at_bat_number"])["pitch_number"]
+        .transform("max")
+    )
+    is_last_pitch = df["pitch_number"] == last_pitch_idx
+    df[EVENT_COL] = df[EVENT_COL].where(is_last_pitch, other=np.nan)
 
     if "game_year" not in df.columns:
         df["game_year"] = pd.to_datetime(df["game_date"], errors="coerce").dt.year
@@ -410,8 +424,9 @@ class Encoders:
             vals = ["<UNK>"] + sorted(series.dropna().astype(str).unique().tolist())
             return {v: i for i, v in enumerate(vals)}
 
-        self.pitch_type = _enc(df[PITCH_TYPE_COL])
-        self.outcome    = _enc(df[OUTCOME_COL])
+        # fillna must be applied to the Series BEFORE _enc(), not on the returned dict
+        self.pitch_type = _enc(df[PITCH_TYPE_COL].fillna("unknown"))
+        self.outcome    = _enc(df[OUTCOME_COL].fillna("unknown"))
         self.event      = _enc(df[EVENT_COL].fillna("none"))
 
         batter_vals  = ["<UNK>"] + sorted(df["batter"].dropna().astype(int).unique().tolist())
@@ -432,7 +447,9 @@ class Encoders:
     def num_pitchers(self):    return len(self.pitcher_id)
 
     def enc_pitch_type(self, v):  return self.pitch_type.get(str(v), 0)
-    def enc_outcome(self, v):     return self.outcome.get(str(v), 0)
+    def enc_outcome(self, v):
+        s = str(v) if pd.notna(v) else "unknown"
+        return self.outcome.get(s, 0)
     def enc_event(self, v):       return self.event.get(str(v) if pd.notna(v) else "none", 0)
     def enc_batter(self, v):      return self.batter_id.get(int(v) if pd.notna(v) else "<UNK>", 0)
     def enc_pitcher(self, v):     return self.pitcher_id.get(int(v) if pd.notna(v) else "<UNK>", 0)
@@ -458,6 +475,17 @@ class StatScaler:
                 vals = pd.to_numeric(df[col], errors="coerce")
                 self.mean_[col] = float(vals.mean()) if not vals.isna().all() else 0.0
                 self.std_[col]  = max(float(vals.std()) if not vals.isna().all() else 1.0, 1e-6)
+                # Guard: columns with extreme values (e.g. IDs, raw integer keys)
+                # should never be in the feature list — warn loudly so they are caught.
+                if abs(self.mean_[col]) > 10_000 or self.std_[col] > 10_000:
+                    import warnings
+                    warnings.warn(
+                        f"[StatScaler] Column '{col}' has extreme values "
+                        f"(mean={self.mean_[col]:.1f}, std={self.std_[col]:.1f}). "
+                        f"This column should not be in the feature list — "
+                        f"remove it from PITCH_CONTINUOUS_COLS or GAME_STATE_COLS.",
+                        stacklevel=2,
+                    )
         return self
 
     def transform(self, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
@@ -767,13 +795,25 @@ class BaseballDatasetBuilder:
 
         # 3. Schedule / win pct (optional enrichment)
         s_cache = self.cache_dir / "schedule.parquet"
-        try:
-            schedule_df    = pull_schedule(seasons, cache_path=str(s_cache))
-            win_pct_lookup = build_win_pct_lookup(schedule_df)
-            print(f"[builder] Win-pct lookup entries: {len(win_pct_lookup):,}")
-        except Exception as e:
-            print(f"[builder] Schedule unavailable ({e}), win pcts default to 0.5")
-            win_pct_lookup = {}
+        wpl_cache = self.cache_dir / "win_pct_lookup.pkl"
+        if wpl_cache.exists():
+            import pickle
+            with open(wpl_cache, "rb") as f:
+                win_pct_lookup = pickle.load(f)
+            print(f"[builder] Loaded win-pct lookup from cache ({len(win_pct_lookup):,} entries)")
+        else:
+            try:
+                schedule_df    = pull_schedule(seasons, cache_path=str(s_cache))
+                win_pct_lookup = build_win_pct_lookup(schedule_df)
+                print(f"[builder] Win-pct lookup entries: {len(win_pct_lookup):,}")
+            except Exception as e:
+                print(f"[builder] Schedule unavailable ({e}), win pcts default to 0.5")
+                win_pct_lookup = {}
+            # Save to cache regardless of whether it succeeded, so we never re-pull
+            import pickle
+            with open(wpl_cache, "wb") as f:
+                pickle.dump(win_pct_lookup, f)
+            print(f"[builder] Saved win-pct lookup to cache")
 
         # 4. Fit encoders on full dataset (vocabulary covers all splits)
         print("[builder] Fitting encoders...")
@@ -859,12 +899,12 @@ class BaseballDatasetBuilder:
 
 if __name__ == "__main__":
     builder = BaseballDatasetBuilder(
-        start_dt      = "2022-04-07",
-        end_dt        = "2024-11-01",
-        val_start_dt  = "2024-03-20",
-        test_start_dt = "2024-10-01",
+        start_dt      = "2021-04-07",
+        end_dt        = "2026-05-01",
+        val_start_dt  = "2025-03-20",
+        test_start_dt = "2026-03-25",
         cache_dir     = "./baseball_cache",
-        max_seq_len   = 350,
+        max_seq_len   = 400,
         min_pitches_per_game = 100,
     )
 

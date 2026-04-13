@@ -38,6 +38,8 @@ import numpy as np
 import torch
 
 # ── Project imports ──────────────────────────────────────────────────────────
+parent_dir = str(Path(__file__).resolve().parent.parent)
+sys.path.append(parent_dir)
 from new_transfusion import (
     TransFusion, ModelConfig,
     find_context_split,
@@ -71,12 +73,13 @@ def _load_model(checkpoint: str, device: torch.device) -> tuple[TransFusion, Mod
 
 def _build_dataset(cache_dir: str, max_seq_len: int):
     builder = BaseballDatasetBuilder(
-        start_dt       = "2022-04-07",
-        end_dt         = "2024-11-01",
-        val_start_dt   = "2024-03-20",
-        test_start_dt  = "2024-10-01",
-        cache_dir      = cache_dir,
-        max_seq_len    = max_seq_len,
+        start_dt      = "2021-04-07",
+        end_dt        = "2026-05-01",
+        val_start_dt  = "2025-03-20",
+        test_start_dt = "2026-03-25",
+        cache_dir     = "./baseball_cache",
+        max_seq_len   = 400,
+        min_pitches_per_game = 100,
     )
     train_ds, val_ds, test_ds, encoders = builder.build()
     return test_ds, encoders, builder.pitch_scaler
