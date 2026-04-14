@@ -4,11 +4,17 @@ TransFusion: Baseball Pitch Sequence Model + MCMC Game Simulator
 Architecture:
     TransFusion = Transformer encoder (context) + Diffusion decoder (continuous pitch features)
                 + dual classification heads (pitch type, pitch outcome)
+                + Pitcher VAE + Batter VAE (latent player representations)
+
+    The VAEs map raw pitcher/batter season statistics to a learned latent space,
+    providing smoother generalization across players — especially for players with
+    limited data — and decoupling player identity from raw stat noise.
 
 Training:
     Given a game sequence, the model learns to denoise the next pitch's continuous
     features (diffusion loss) while simultaneously classifying the next pitch type
-    and the next pitch outcome (cross-entropy losses).
+    and the next pitch outcome (cross-entropy losses). Pitcher and batter VAEs are
+    trained jointly with KL divergence and reconstruction losses.
 
     NOTE ON SCORE IN FEATURES:
     home_score / away_score / run_diff are VALID inputs — at position t they only
@@ -29,33 +35,6 @@ Simulation (MCMC):
         4. Advance game state (count, outs, runners, score) deterministically
         5. Repeat until 27 outs (or extras)
     Run K parallel simulations → aggregate win probabilities.
-
-Usage:
-    # Train
-    python new_transfusion.py train \
-        --cache_dir ./baseball_cache \
-        --checkpoint_dir ./checkpoints \
-        --epochs 40 \
-        --batch_size 16
-
-    # Simulate
-    python new_transfusion.py simulate \
-        --checkpoint ./checkpoints/best.pt \
-        --cache_dir ./baseball_cache \
-        --context_innings 3.0 \
-        --n_simulations 500 \
-        --split test \
-        --out_dir ./sim_results
-
-    # PowerShell sweep
-    foreach ($inn in @("0.0","0.5","1.0","1.5","2.0","2.5","3.0","3.5","4.0","4.5","5.0","5.5","6.0","6.5","7.0","7.5","8.0","8.5")) {
-        python new_transfusion.py simulate `
-            --checkpoint ./checkpoints/best.pt `
-            --context_innings $inn `
-            --n_simulations 500 `
-            --split test `
-            --out_dir ./sim_results
-    }
 """
 
 import argparse
@@ -72,6 +51,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from new_dataset_builder import (
     BaseballDatasetBuilder,
@@ -104,24 +84,24 @@ except ImportError:
 @dataclass
 class ModelConfig:
     # Input dims (overridden from dataset at runtime)
-    pitch_feat_dim:   int = 30    # len(PITCH_CONTINUOUS_COLS + GAME_STATE_COLS)
-    pitcher_feat_dim: int = 17    # len(PITCHER_STAT_COLS)
-    batter_feat_dim:  int = 14    # len(BATTER_STAT_COLS)
-    game_feat_dim:    int = 3     # len(GAME_CTX_COLS)
+    pitch_feat_dim:   int = 30
+    pitcher_feat_dim: int = 17
+    batter_feat_dim:  int = 14
+    game_feat_dim:    int = 3
 
     # Vocab sizes (overridden from encoders at runtime)
     num_pitch_types: int = 20
     num_outcomes:    int = 30
     num_events:      int = 25
-    num_batters:     int = 2000
-    num_pitchers:    int = 1000
+    num_batters:     int = 5000
+    num_pitchers:    int = 3500
 
     # Transformer
     d_model:     int   = 256
     n_heads:     int   = 8
     n_layers:    int   = 6
-    d_ff:        int   = 1024
-    dropout:     float = 0.1
+    d_ff:        int   = 2048
+    dropout:     float = 0.2
     max_seq_len: int   = 400
 
     # Diffusion
@@ -130,12 +110,19 @@ class ModelConfig:
     beta_end:          float = 0.02
 
     # Embeddings
-    embed_dim: int = 64
+    embed_dim: int = 128
 
-    # Loss weights
-    lambda_diffusion:  float = 1.0
-    lambda_pitch_type: float = 0.5
-    lambda_outcome:    float = 0.5
+    # VAE latent dimensions
+    pitcher_latent_dim: int = 64   # latent space for pitcher stats
+    batter_latent_dim:  int = 64   # latent space for batter stats
+
+    # VAE loss weight — how much KL + recon contribute to total loss
+    lambda_vae: float = 0.05
+
+    # Loss weights (sum to 1.0)
+    lambda_diffusion:  float = 0.20
+    lambda_pitch_type: float = 0.40
+    lambda_outcome:    float = 0.40
 
 
 @dataclass
@@ -144,17 +131,17 @@ class TrainConfig:
     checkpoint_dir: str   = "./checkpoints"
     start_dt:       str   = "2021-04-07"
     end_dt:         str   = "2026-05-01"
-    val_start_dt:   str   = "2025-03-20"
+    val_start_dt:   str   = "2026-02-01"
     test_start_dt:  str   = "2026-03-25"
-    epochs:         int   = 40
+    epochs:         int   = 60
     batch_size:     int   = 16
-    lr:             float = 3e-4
+    lr:             float = 2e-4
     weight_decay:   float = 1e-4
     grad_clip:      float = 1.0
-    warmup_steps:   int   = 500
+    warmup_steps:   int   = 1000
     log_every:      int   = 50
     val_every:      int   = 1
-    num_workers:    int   = 4
+    num_workers:    int   = 0
     seed:           int   = 42
     device:         str   = "auto"
 
@@ -165,7 +152,7 @@ class SimConfig:
     cache_dir:        str   = "./baseball_cache"
     start_dt:         str   = "2021-04-07"
     end_dt:           str   = "2026-05-01"
-    val_start_dt:     str   = "2025-03-20"
+    val_start_dt:     str   = "2026-02-01"
     test_start_dt:    str   = "2026-03-25"
     context_innings:  float = 3.0
     n_simulations:    int   = 500
@@ -173,6 +160,7 @@ class SimConfig:
     out_dir:          str   = "./sim_results"
     max_game_pitches: int   = 400
     device:           str   = "auto"
+    temperature:      float = 1.0
 
 
 # =============================================================================
@@ -232,6 +220,102 @@ class CosineNoiseSchedule(nn.Module):
 
 
 # =============================================================================
+# 1b.  PLAYER VAEs
+# =============================================================================
+
+class PlayerVAE(nn.Module):
+    """
+    Variational Autoencoder for player season statistics.
+
+    Encodes a raw stat vector (pitcher or batter) into a learned latent space
+    z ~ N(μ, σ²) via the reparameterization trick. The decoder reconstructs
+    the original stats from z, providing a reconstruction loss signal.
+
+    During training: encode stats → sample z → decode → compute KL + recon.
+    During inference: encode stats → use μ directly (no sampling noise).
+
+    The latent vector z replaces the raw stat vector as input to the
+    ContextEncoder's global conditioning, giving the transformer a smoother,
+    more generalizable representation of pitcher/batter identity.
+
+    For unseen players or players with few pitches, the encoder will map
+    their stats close to the prior N(0, I), providing graceful degradation
+    rather than out-of-distribution raw stat values.
+    """
+
+    def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # Encoder: stats → (μ, log σ²)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        self.fc_mu     = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # Decoder: z → reconstructed stats
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (μ, log σ²) for the input stat vector."""
+        h      = self.encoder(x)
+        mu     = self.fc_mu(h)
+        logvar = self.fc_logvar(h).clamp(-4.0, 4.0)  # clamp for stability
+        return mu, logvar
+
+    def reparameterize(self, mu: torch.Tensor,
+                       logvar: torch.Tensor) -> torch.Tensor:
+        """Sample z = μ + ε·σ using the reparameterization trick."""
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu  # deterministic at inference
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns (z, μ, log σ²).
+        z is the sampled latent (or μ at inference).
+        """
+        mu, logvar = self.encode(x)
+        z          = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+
+    @staticmethod
+    def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """KL divergence KL(N(μ,σ²) || N(0,I)), averaged over batch."""
+        return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+    def vae_loss(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Full VAE loss: reconstruction MSE + KL divergence.
+        Returns (z, recon_loss, kl_loss).
+        """
+        z, mu, logvar = self.forward(x)
+        x_recon       = self.decode(z)
+        recon_loss    = F.mse_loss(x_recon, x)
+        kl            = self.kl_loss(mu, logvar)
+        return z, recon_loss, kl
+
+
+# =============================================================================
 # 2.  MODEL COMPONENTS
 # =============================================================================
 
@@ -268,7 +352,11 @@ class ContextEncoder(nn.Module):
     Causal Transformer encoder over pitch sequences.
 
     Per-step input:  pitch_seq + batter_ctx + batter_id_emb + ptype_emb + outcome_emb
-    Global context:  pitcher_ctx + pitcher_id_emb + game_ctx + batting_order_emb
+    Global context:  pitcher_latent (from VAE) + pitcher_id_emb + game_ctx
+                     + batting_order_emb + batter_latent_mean (mean of lineup VAE latents)
+
+    The VAE latent vectors replace raw pitcher_ctx and batter_ctx in the global
+    conditioning, providing smoother player representations.
 
     Score columns (home_score, away_score, run_diff) are included in pitch_seq
     and are VALID — at position t they only reflect the score up to that pitch,
@@ -279,6 +367,8 @@ class ContextEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        # Per-step input: pitch feats + per-pitch batter stats + embeddings
+        # Note: batter_ctx is still used per-step for at-bat specific context
         per_step_in = (
             cfg.pitch_feat_dim
             + cfg.batter_feat_dim
@@ -288,11 +378,13 @@ class ContextEncoder(nn.Module):
         )
         self.step_proj = nn.Linear(per_step_in, cfg.d_model)
 
+        # Global conditioning now uses VAE latents instead of raw stats
         global_in = (
-            cfg.pitcher_feat_dim
-            + cfg.embed_dim   # pitcher_id
+            cfg.pitcher_latent_dim  # pitcher VAE latent (replaces raw pitcher_ctx)
+            + cfg.embed_dim         # pitcher_id
             + cfg.game_feat_dim
-            + cfg.embed_dim   # batting_order mean pool
+            + cfg.embed_dim         # batting_order mean pool
+            + cfg.batter_latent_dim # mean batter VAE latent over lineup
         )
         self.global_proj = nn.Linear(global_in, cfg.d_model)
 
@@ -314,17 +406,18 @@ class ContextEncoder(nn.Module):
 
     def forward(
         self,
-        pitch_seq:     torch.Tensor,  # [B, T, F_pitch]
-        pitch_types:   torch.Tensor,  # [B, T]
-        outcomes:      torch.Tensor,  # [B, T]
-        batter_ctx:    torch.Tensor,  # [B, T, F_batter]
-        batter_ids:    torch.Tensor,  # [B, T]
-        pitcher_ctx:   torch.Tensor,  # [B, F_pitcher]
-        pitcher_id:    torch.Tensor,  # [B]
-        batting_order: torch.Tensor,  # [B, 9]
-        game_ctx:      torch.Tensor,  # [B, F_game]
-        mask:          torch.Tensor,  # [B, T] True=valid
-    ) -> torch.Tensor:                # [B, T, d_model]
+        pitch_seq:      torch.Tensor,  # [B, T, F_pitch]
+        pitch_types:    torch.Tensor,  # [B, T]
+        outcomes:       torch.Tensor,  # [B, T]
+        batter_ctx:     torch.Tensor,  # [B, T, F_batter]
+        batter_ids:     torch.Tensor,  # [B, T]
+        pitcher_latent: torch.Tensor,  # [B, pitcher_latent_dim]  ← from VAE
+        pitcher_id:     torch.Tensor,  # [B]
+        batting_order:  torch.Tensor,  # [B, 9]
+        game_ctx:       torch.Tensor,  # [B, F_game]
+        batter_latent:  torch.Tensor,  # [B, batter_latent_dim]   ← mean over lineup VAE
+        mask:           torch.Tensor,  # [B, T] True=valid
+    ) -> torch.Tensor:                 # [B, T, d_model]
 
         B, T, _ = pitch_seq.shape
 
@@ -337,8 +430,12 @@ class ContextEncoder(nn.Module):
 
         p_emb     = self.pitcher_emb(pitcher_id)
         ord_emb   = self.order_emb(batting_order).mean(dim=1)
-        global_in = torch.cat([pitcher_ctx, p_emb, game_ctx, ord_emb], dim=-1)
-        g_vec     = self.global_proj(global_in).unsqueeze(1)
+
+        # Global conditioning uses VAE latents instead of raw stats
+        global_in = torch.cat(
+            [pitcher_latent, p_emb, game_ctx, ord_emb, batter_latent], dim=-1
+        )
+        g_vec = self.global_proj(global_in).unsqueeze(1)
         x = x + g_vec
 
         x = self.pos_enc(x)
@@ -391,8 +488,6 @@ class ClassificationHeads(nn.Module):
       - outcome_head:    predicts outcomes[t+1]    from context[t]
 
     Both are shifted-by-1 predictions — context[t] never contains the target.
-    This eliminates the self-prediction leakage that existed when outcome_head
-    predicted outcomes[t] from context[t] (which embedded outcomes[t] directly).
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -428,6 +523,54 @@ class TransFusion(nn.Module):
         self.schedule = CosineNoiseSchedule(cfg.n_diffusion_steps)
         self.n_cont   = len(PITCH_CONTINUOUS_COLS)
 
+        # Player VAEs — jointly trained with the main model
+        self.pitcher_vae = PlayerVAE(
+            input_dim  = cfg.pitcher_feat_dim,
+            latent_dim = cfg.pitcher_latent_dim,
+            hidden_dim = max(64, cfg.pitcher_latent_dim * 4),
+        )
+        self.batter_vae = PlayerVAE(
+            input_dim  = cfg.batter_feat_dim,
+            latent_dim = cfg.batter_latent_dim,
+            hidden_dim = max(64, cfg.batter_latent_dim * 4),
+        )
+
+    def _encode_players(
+        self,
+        pitcher_ctx:   torch.Tensor,  # [B, F_pitcher]
+        batter_ctx:    torch.Tensor,  # [B, T, F_batter] — per-pitch batter stats
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Encode pitcher and batter stats through their respective VAEs.
+
+        For the batter, we encode each per-pitch batter stat vector, then
+        mean-pool the latents over the sequence to get a single game-level
+        batter representation for global conditioning.
+
+        Returns:
+            pitcher_z:       [B, pitcher_latent_dim]
+            pitcher_recon_l: scalar
+            pitcher_kl:      scalar
+            batter_z_mean:   [B, batter_latent_dim]  — mean over sequence
+            batter_kl:       scalar
+        """
+        # Pitcher VAE
+        pitcher_z, pitcher_recon_l, pitcher_kl = self.pitcher_vae.vae_loss(pitcher_ctx)
+
+        # Batter VAE — reshape [B, T, F] → [B*T, F], encode, reshape back
+        B, T, F_bat = batter_ctx.shape
+        batter_flat = batter_ctx.reshape(B * T, F_bat)
+        batter_z_flat, batter_mu_flat, batter_logvar_flat = self.batter_vae(batter_flat)
+
+        # KL over all batter positions
+        batter_kl = PlayerVAE.kl_loss(batter_mu_flat, batter_logvar_flat)
+
+        # Mean pool batter latents over sequence for global conditioning
+        batter_z_seq  = batter_z_flat.reshape(B, T, self.cfg.batter_latent_dim)
+        batter_z_mean = batter_z_seq.mean(dim=1)  # [B, batter_latent_dim]
+
+        return pitcher_z, pitcher_recon_l, pitcher_kl, batter_z_mean, batter_kl
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         pitch_seq     = batch["pitch_seq"]
         pitch_types   = batch["pitch_types"]
@@ -442,34 +585,40 @@ class TransFusion(nn.Module):
 
         B, T, _ = pitch_seq.shape
 
-        # ── 1. Encode full sequence causally ──────────────────────────────
+        # ── 1. Encode players through VAEs ────────────────────────────────
+        pitcher_z, pitcher_recon_l, pitcher_kl, batter_z_mean, batter_kl = \
+            self._encode_players(pitcher_ctx, batter_ctx)
+
+        vae_loss = pitcher_recon_l + pitcher_kl + batter_kl
+
+        # ── 2. Encode full sequence causally ──────────────────────────────
         context = self.encoder(
             pitch_seq, pitch_types, outcomes,
             batter_ctx, batter_ids,
-            pitcher_ctx, pitcher_id,
-            batting_order, game_ctx, mask,
+            pitcher_z,      # ← VAE latent replaces raw pitcher_ctx
+            pitcher_id,
+            batting_order, game_ctx,
+            batter_z_mean,  # ← VAE latent replaces raw batter mean pool
+            mask,
         )  # [B, T, d_model]
 
-        # ── 2. Classification losses (both shifted by 1) ───────────────────
-        pt_logits, oc_logits = self.heads(context)  # [B, T, V]
+        # ── 3. Classification losses (both shifted by 1) ───────────────────
+        pt_logits, oc_logits = self.heads(context)
 
-        # Pitch type: context[t] → pitch_types[t+1]
         pt_loss = F.cross_entropy(
             pt_logits[:, :-1].reshape(-1, self.cfg.num_pitch_types),
             pitch_types[:, 1:].reshape(-1),
             ignore_index=0,
+            label_smoothing=0.05,
         )
-
-        # Outcome: context[t] → outcomes[t+1]
-        # FIX: was predicting outcomes[t] from context[t] which contained
-        # outcomes[t]'s embedding — trivial self-prediction. Now shifted by 1.
         oc_loss = F.cross_entropy(
             oc_logits[:, :-1].reshape(-1, self.cfg.num_outcomes),
             outcomes[:, 1:].reshape(-1),
             ignore_index=0,
+            label_smoothing=0.05,
         )
 
-        # ── 3. Diffusion loss: context[t] → continuous features of pitch[t+1]
+        # ── 4. Diffusion loss ─────────────────────────────────────────────
         x0 = pitch_seq[:, 1:, :self.n_cont].reshape(B * (T - 1), self.n_cont)
         t_diff = torch.randint(0, self.cfg.n_diffusion_steps, (B * (T - 1),), device=x0.device)
         x_t, noise = self.schedule.q_sample(x0, t_diff)
@@ -482,43 +631,79 @@ class TransFusion(nn.Module):
         valid     = mask[:, 1:].reshape(-1)
         diff_loss = F.mse_loss(noise_pred[valid], noise[valid])
 
-        # ── 4. Weighted total loss ─────────────────────────────────────────
+        # ── 5. Weighted total loss ─────────────────────────────────────────
         loss = (
             self.cfg.lambda_diffusion  * diff_loss
             + self.cfg.lambda_pitch_type * pt_loss
             + self.cfg.lambda_outcome    * oc_loss
+            + self.cfg.lambda_vae        * vae_loss
         )
 
         return {
-            "loss":      loss,
-            "diff_loss": diff_loss.detach(),
-            "pt_loss":   pt_loss.detach(),
-            "oc_loss":   oc_loss.detach(),
+            "loss":          loss,
+            "diff_loss":     diff_loss.detach(),
+            "pt_loss":       pt_loss.detach(),
+            "oc_loss":       oc_loss.detach(),
+            "vae_loss":      vae_loss.detach(),
+            "pitcher_recon": pitcher_recon_l.detach(),
+            "pitcher_kl":    pitcher_kl.detach(),
+            "batter_kl":     batter_kl.detach(),
         }
 
     @torch.no_grad()
+    def _get_player_latents(
+        self,
+        pitcher_ctx:   torch.Tensor,  # [B, F_pitcher]
+        batter_ctx:    torch.Tensor,  # [B, T, F_batter] or [B, F_batter]
+        is_sequence:   bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get deterministic player latents (μ, no sampling) for inference.
+        Returns (pitcher_z, batter_z_mean).
+        """
+        pitcher_mu, _ = self.pitcher_vae.encode(pitcher_ctx)
+
+        if is_sequence:
+            B, T, F = batter_ctx.shape
+            batter_flat = batter_ctx.reshape(B * T, F)
+            batter_mu_flat, _ = self.batter_vae.encode(batter_flat)
+            batter_z_mean = batter_mu_flat.reshape(B, T, self.cfg.batter_latent_dim).mean(dim=1)
+        else:
+            batter_z_mean, _ = self.batter_vae.encode(batter_ctx)
+
+        return pitcher_mu, batter_z_mean
+
+    @torch.no_grad()
     def encode_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        pitcher_z, batter_z_mean = self._get_player_latents(
+            batch["pitcher_ctx"], batch["batter_ctx"], is_sequence=True
+        )
         return self.encoder(
             batch["pitch_seq"], batch["pitch_types"], batch["outcomes"],
             batch["batter_ctx"], batch["batter_ids"],
-            batch["pitcher_ctx"], batch["pitcher_id"],
-            batch["batting_order"], batch["game_ctx"], batch["mask"],
+            pitcher_z,
+            batch["pitcher_id"],
+            batch["batting_order"], batch["game_ctx"],
+            batter_z_mean,
+            batch["mask"],
         )
 
     @torch.no_grad()
-    def predict_next_pitch_type(self, context_vec: torch.Tensor) -> torch.Tensor:
+    def predict_next_pitch_type(self, context_vec: torch.Tensor,
+                                temperature: float = 0.90) -> torch.Tensor:
         pt_logits, _ = self.heads(context_vec)
-        return F.softmax(pt_logits, dim=-1)
+        return F.softmax(pt_logits / temperature, dim=-1)
 
     @torch.no_grad()
-    def predict_next_outcome(self, context_vec: torch.Tensor) -> torch.Tensor:
+    def predict_next_outcome(self, context_vec: torch.Tensor,
+                             temperature: float = 0.85) -> torch.Tensor:
         _, oc_logits = self.heads(context_vec)
-        return F.softmax(oc_logits, dim=-1)
+        return F.softmax(oc_logits / temperature, dim=-1)
 
     @torch.no_grad()
     def sample_pitch_features(self, context_vec: torch.Tensor,
                                pitch_type: torch.Tensor,
-                               ddim_steps: int = 20) -> torch.Tensor:
+                               ddim_steps: int = 10) -> torch.Tensor:
         B      = context_vec.shape[0]
         device = context_vec.device
 
@@ -529,20 +714,24 @@ class TransFusion(nn.Module):
             _model_fn, (B, self.n_cont), device, n_steps=ddim_steps
         )
 
+    @torch.no_grad()
+    def get_batter_latent(self, batter_stats: torch.Tensor) -> torch.Tensor:
+        """Get batter latent for a single batter during simulation. [1, F] → [1, latent_dim]"""
+        mu, _ = self.batter_vae.encode(batter_stats)
+        return mu
+
+    @torch.no_grad()
+    def get_pitcher_latent(self, pitcher_stats: torch.Tensor) -> torch.Tensor:
+        """Get pitcher latent for a single pitcher during simulation. [1, F] → [1, latent_dim]"""
+        mu, _ = self.pitcher_vae.encode(pitcher_stats)
+        return mu
+
 
 # =============================================================================
 # 4a. RE24 RUN EXPECTANCY TABLE
-#     Expected runs from each (outs, runners) state to end of half-inning.
-#     Empirical values from Statcast 2021-2024 regular season.
-#     State key: (outs, on_1b, on_2b, on_3b) → expected runs
 # =============================================================================
 
-# RE24 run-expectancy table — populated at simulation time from empirically
-# computed parquet (see new_dataset_builder.build()).  Fallback values below
-# are sourced from FanGraphs (2014 neutral park, 4.15 R/G environment):
-# https://library.fangraphs.com/misc/re24/
 _RE24_TABLE_CACHE: Dict[Tuple[int, bool, bool, bool], float] = {
-    # (outs, on_1b, on_2b, on_3b): expected runs to end of half-inning
     (0, False, False, False): 0.461, (0, True,  False, False): 0.831,
     (0, False, True,  False): 1.068, (0, True,  True,  False): 1.373,
     (0, False, False, True):  1.426, (0, True,  False, True):  1.798,
@@ -560,7 +749,6 @@ _RE24_MAX_CACHE: float = 2.282
 
 
 def _load_re24_table(cache_dir: str) -> None:
-    """Load empirical RE24 table from parquet; updates module-level cache."""
     global _RE24_TABLE_CACHE, _RE24_MAX_CACHE
     import pandas as _pd
     path = Path(cache_dir) / "re24_table.parquet"
@@ -577,7 +765,6 @@ def _load_re24_table(cache_dir: str) -> None:
 
 
 def _phi(outs: int, on_1b: bool, on_2b: bool, on_3b: bool) -> float:
-    """Log-normalized RE24 score φ(s) ≤ 0 (eq. 3 in paper)."""
     re = _RE24_TABLE_CACHE.get((outs, on_1b, on_2b, on_3b), 0.0)
     return math.log(max(re, 1e-6)) - math.log(_RE24_MAX_CACHE)
 
@@ -634,29 +821,15 @@ class GameState:
         self.strikes     = 0
 
     def is_game_over(self, min_innings: int = 9) -> bool:
-        """
-        Baseball extra-innings rules — no ties allowed:
-          - Game ends after the bottom of the 9th (or later) IF the scores differ.
-          - If tied after the bottom of the 9th (or any extra inning), play continues.
-          - Walk-off: home team scores to take the lead in the bottom of any inning
-            >= 9th → game ends immediately (handled in apply_event via _add_score).
-        """
         if self.inning < min_innings:
             return False
-        # End of a bottom half-inning (outs == 3 means _end_half_inning just fired,
-        # so inning has already advanced). Check the inning BEFORE it advanced:
-        # we detect this by checking is_top == True (just flipped) and inning > min.
-        # Simpler: game ends when outs just hit 3 in the bottom of inning >= min_innings
-        # AND scores are not tied. Walk-offs are handled separately.
         if self.is_top and self.inning > min_innings and self.home_score != self.away_score:
             return True
-        # Standard: bottom of 9th+ complete and scores differ
         if self.is_top and self.inning > min_innings:
             return self.home_score != self.away_score
         return False
 
     def is_walkoff(self) -> bool:
-        """Home team took the lead in the bottom of an inning >= 9th."""
         return (
             not self.is_top
             and self.inning >= 9
@@ -748,7 +921,6 @@ class GameState:
             self.away_score += runs
         else:
             self.home_score += runs
-            # Walk-off: home takes the lead in bottom of 9th+, game ends
             if self.inning >= 9 and self.home_score > self.away_score:
                 self._walkoff = True
 
@@ -764,16 +936,10 @@ class GameState:
         else:
             self.inning += 1
             self.is_top = True
-            # Automatic runner on 2nd in extra innings (MLB rule since 2020)
             if self.inning > 9:
                 self.on_2b = True
 
     def to_feature_vec(self, pitch_scaler) -> np.ndarray:
-        """
-        Produce the GAME_STATE_COLS feature vector for the next simulated pitch.
-        Includes current (simulated) score — this is valid: the model uses the
-        running score as context, not a future/final score.
-        """
         raw = {
             "balls":        float(self.balls),
             "strikes":      float(self.strikes),
@@ -819,19 +985,18 @@ def get_lr_scheduler(optimizer, warmup_steps: int, total_steps: int):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-
 def _model_tag(cfg_model: ModelConfig) -> str:
-    """Short filename-safe string encoding key model hyperparameters."""
     return (
         f"d{cfg_model.d_model}"
         f"_L{cfg_model.n_layers}"
         f"_H{cfg_model.n_heads}"
         f"_ff{cfg_model.d_ff}"
         f"_T{cfg_model.n_diffusion_steps}"
+        f"_vae{cfg_model.pitcher_latent_dim}"
     )
 
 
@@ -841,15 +1006,6 @@ def _save_loss_plots(
     cfg_train: TrainConfig,
     out_dir:   Path,
 ):
-    """
-    Save two PNG files per training run, named with model hyperparameters:
-
-    1. transfusion_loss_total_{tag}_ep{N}.png
-       — train vs val total loss, with best-epoch marker
-
-    2. transfusion_loss_components_{tag}_ep{N}.png
-       — 3-panel: diff_loss / pt_loss / oc_loss (train only, val not broken out)
-    """
     if not _HAVE_MPL:
         print("[train] matplotlib not available — skipping loss plots")
         return
@@ -859,37 +1015,31 @@ def _save_loss_plots(
     n_ep   = len(history["train_loss"])
     epochs = list(range(1, n_ep + 1))
 
-    # ── Plot 1: total train + val loss ────────────────────────────────────
+    # Plot 1: total train + val loss
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(epochs, history["train_loss"], label="Train Loss",  color="steelblue", linewidth=1.8)
     ax.plot(epochs, history["val_loss"],   label="Val Loss",    color="tomato",    linewidth=1.8)
-
     best_ep = int(np.argmin(history["val_loss"])) + 1
     ax.axvline(best_ep, color="tomato", linestyle="--", alpha=0.55,
                label=f"Best val epoch={best_ep}")
-
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
     ax.set_title(
         f"TransFusion — Total Loss\n"
-        f"d_model={cfg_model.d_model}  layers={cfg_model.n_layers}  "
-        f"heads={cfg_model.n_heads}  d_ff={cfg_model.d_ff}  "
-        f"T_diff={cfg_model.n_diffusion_steps}"
+        f"d={cfg_model.d_model}  L={cfg_model.n_layers}  H={cfg_model.n_heads}  "
+        f"VAE latent={cfg_model.pitcher_latent_dim}/{cfg_model.batter_latent_dim}"
     )
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    ax.legend(); ax.grid(True, alpha=0.3); fig.tight_layout()
     fname1 = out_dir / f"transfusion_loss_total_{tag}_ep{n_ep}.png"
-    fig.savefig(fname1, dpi=130, bbox_inches="tight")
-    plt.close(fig)
+    fig.savefig(fname1, dpi=130, bbox_inches="tight"); plt.close(fig)
     print(f"[train] Loss plot (total)      → {fname1}")
 
-    # ── Plot 2: component losses ──────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    # Plot 2: component losses (4 panels now including VAE)
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
     components = [
         ("diff_loss", "Diffusion MSE",   "steelblue"),
         ("pt_loss",   "Pitch-Type CE",   "seagreen"),
         ("oc_loss",   "Outcome CE",      "darkorange"),
+        ("vae_loss",  "VAE Loss",        "mediumpurple"),
     ]
     for ax, (key, label, color) in zip(axes, components):
         train_vals = history.get(f"train_{key}", [])
@@ -900,22 +1050,16 @@ def _save_loss_plots(
             ax.plot(epochs[:len(val_vals)], val_vals,
                     label="Val", color=color, linewidth=1.8, linestyle="--", alpha=0.8)
         ax.axvline(best_ep, color="tomato", linestyle=":", alpha=0.5)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss")
-        ax.set_title(label)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
+        ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
+        ax.set_title(label); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     fig.suptitle(
         f"TransFusion — Component Losses  |  "
-        f"d={cfg_model.d_model}  L={cfg_model.n_layers}  "
-        f"H={cfg_model.n_heads}  ff={cfg_model.d_ff}  T={cfg_model.n_diffusion_steps}",
+        f"d={cfg_model.d_model}  L={cfg_model.n_layers}  H={cfg_model.n_heads}",
         fontsize=10,
     )
     fig.tight_layout()
     fname2 = out_dir / f"transfusion_loss_components_{tag}_ep{n_ep}.png"
-    fig.savefig(fname2, dpi=130, bbox_inches="tight")
-    plt.close(fig)
+    fig.savefig(fname2, dpi=130, bbox_inches="tight"); plt.close(fig)
     print(f"[train] Loss plot (components) → {fname2}")
 
 
@@ -953,6 +1097,9 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
     print(f"[train] pitch_feat_dim={cfg_model.pitch_feat_dim}  "
           f"pitcher_feat_dim={cfg_model.pitcher_feat_dim}  "
           f"batter_feat_dim={cfg_model.batter_feat_dim}")
+    print(f"[train] pitcher_latent={cfg_model.pitcher_latent_dim}  "
+          f"batter_latent={cfg_model.batter_latent_dim}  "
+          f"lambda_vae={cfg_model.lambda_vae}")
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg_train.batch_size, shuffle=True,
@@ -969,33 +1116,42 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] TransFusion parameters: {n_params:,}")
 
-    optimizer    = torch.optim.AdamW(model.parameters(), lr=cfg_train.lr,
-                                     weight_decay=cfg_train.weight_decay)
-    total_steps  = cfg_train.epochs * len(train_loader)
-    scheduler    = get_lr_scheduler(optimizer, cfg_train.warmup_steps, total_steps)
-    scaler_amp   = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    optimizer   = torch.optim.AdamW(
+        model.parameters(), lr=cfg_train.lr,
+        weight_decay=cfg_train.weight_decay,
+        betas=(0.9, 0.98), eps=1e-9,
+    )
+    total_steps = cfg_train.epochs * len(train_loader)
+    scheduler   = get_lr_scheduler(optimizer, cfg_train.warmup_steps, total_steps)
+    scaler_amp  = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     _save_json(vars(cfg_model), ckpt_dir / "model_config.json")
 
     best_val_loss = float("inf")
     global_step   = 0
 
-    # History for loss plots
     history: Dict[str, List[float]] = {
         "train_loss": [], "val_loss": [],
-        "train_diff_loss": [], "train_pt_loss": [], "train_oc_loss": [],
-        "val_diff_loss":   [], "val_pt_loss":   [], "val_oc_loss":   [],
+        "train_diff_loss": [], "train_pt_loss": [], "train_oc_loss": [], "train_vae_loss": [],
+        "val_diff_loss":   [], "val_pt_loss":   [], "val_oc_loss":   [], "val_vae_loss":   [],
     }
 
     for epoch in range(1, cfg_train.epochs + 1):
         model.train()
-        epoch_losses = {"loss": 0.0, "diff_loss": 0.0, "pt_loss": 0.0, "oc_loss": 0.0}
+        epoch_losses = {
+            "loss": 0.0, "diff_loss": 0.0, "pt_loss": 0.0,
+            "oc_loss": 0.0, "vae_loss": 0.0,
+        }
         t0 = time.time()
 
-        for step, batch in enumerate(train_loader):
+        for step, batch in tqdm(
+            enumerate(train_loader), total=len(train_loader),
+            desc=f"Epoch {epoch}/{cfg_train.epochs}"
+        ):
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 losses = model(batch)
+
             scaler_amp.scale(losses["loss"]).backward()
             scaler_amp.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg_train.grad_clip)
@@ -1004,8 +1160,10 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             global_step += 1
+
             for k in epoch_losses:
                 epoch_losses[k] += losses[k].item()
+
             if global_step % cfg_train.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
                 print(f"  ep={epoch:3d} step={global_step:6d} "
@@ -1013,17 +1171,18 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
                       f"diff={losses['diff_loss'].item():.4f} "
                       f"pt={losses['pt_loss'].item():.4f} "
                       f"oc={losses['oc_loss'].item():.4f} "
+                      f"vae={losses['vae_loss'].item():.4f} "
                       f"lr={lr:.2e}")
 
         n = len(train_loader)
         print(f"[epoch {epoch:3d}] train_loss={epoch_losses['loss']/n:.4f}  "
               f"({time.time()-t0:.0f}s)")
 
-        # Record training losses
         history["train_loss"].append(epoch_losses["loss"] / n)
         history["train_diff_loss"].append(epoch_losses["diff_loss"] / n)
         history["train_pt_loss"].append(epoch_losses["pt_loss"] / n)
         history["train_oc_loss"].append(epoch_losses["oc_loss"] / n)
+        history["train_vae_loss"].append(epoch_losses["vae_loss"] / n)
 
         if epoch % cfg_train.val_every == 0:
             val_metrics = _evaluate(model, val_loader, device)
@@ -1031,13 +1190,14 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
             print(f"[epoch {epoch:3d}] val_loss={val_loss:.4f}  "
                   f"diff={val_metrics['diff_loss']:.4f}  "
                   f"pt={val_metrics['pt_loss']:.4f}  "
-                  f"oc={val_metrics['oc_loss']:.4f}")
+                  f"oc={val_metrics['oc_loss']:.4f}  "
+                  f"vae={val_metrics['vae_loss']:.4f}")
 
-            # Record validation losses
             history["val_loss"].append(val_loss)
             history["val_diff_loss"].append(val_metrics["diff_loss"])
             history["val_pt_loss"].append(val_metrics["pt_loss"])
             history["val_oc_loss"].append(val_metrics["oc_loss"])
+            history["val_vae_loss"].append(val_metrics["vae_loss"])
 
             torch.save({
                 "epoch": epoch,
@@ -1046,6 +1206,7 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
                 "val_loss": val_loss,
                 "cfg_model": vars(cfg_model),
             }, ckpt_dir / "latest.pt")
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save({
@@ -1057,13 +1218,9 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
                 print(f"  ✓ New best val_loss={val_loss:.4f}")
 
     print(f"[train] Done. Best val_loss={best_val_loss:.4f}")
-
-    # Save loss plots
     _save_loss_plots(
-        history   = history,
-        cfg_model = cfg_model,
-        cfg_train = cfg_train,
-        out_dir   = Path(cfg_train.checkpoint_dir) / "plots",
+        history=history, cfg_model=cfg_model, cfg_train=cfg_train,
+        out_dir=Path(cfg_train.checkpoint_dir) / "plots",
     )
 
 
@@ -1071,9 +1228,8 @@ def train(cfg_train: TrainConfig, cfg_model: ModelConfig):
 def _evaluate(
     model: TransFusion, loader: DataLoader, device: torch.device
 ) -> Dict[str, float]:
-    """Returns dict with total loss + each component loss averaged over val set."""
     model.eval()
-    totals = {"loss": 0.0, "diff_loss": 0.0, "pt_loss": 0.0, "oc_loss": 0.0}
+    totals = {"loss": 0.0, "diff_loss": 0.0, "pt_loss": 0.0, "oc_loss": 0.0, "vae_loss": 0.0}
     count  = 0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -1107,24 +1263,9 @@ class SimResult:
     actual_home_win:   Optional[bool]
 
 
-
 def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
                        lam: float = 1.0, n_steps: int = 500,
                        burn_in: int = 100):
-    """
-    Metropolis-Hastings win probability estimation.
-
-    Target distribution (eq. 1):
-        π(τ|c) ∝ P_θ(τ|c) · exp(λ · Σ_k φ(s_k))
-
-    Proposal: suffix-resimulation (eq. 2) — pick a random half-inning
-    boundary k, keep prefix τ[0:k], resimulate suffix from game state x_k.
-
-    Acceptance ratio (eq. 3):
-        α = min(1, m(τ)/m(τ') · exp(λ · Σ_{j≥k} [φ(s'_j) - φ(s_j)]))
-
-    At λ=0, α=1 always → recovers independent Monte Carlo exactly.
-    """
     device  = _resolve_device(cfg_sim.device)
     out_dir = Path(cfg_sim.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1142,23 +1283,21 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
     print(f"[mh-sim] λ={lam}  steps={n_steps}  burn_in={burn_in}")
 
     builder = BaseballDatasetBuilder(
-        start_dt             = cfg_sim.start_dt,
-        end_dt               = cfg_sim.end_dt,
-        val_start_dt         = cfg_sim.val_start_dt,
-        test_start_dt        = cfg_sim.test_start_dt,
-        cache_dir            = cfg_sim.cache_dir,
-        max_seq_len          = cfg_model.max_seq_len,
-        min_pitches_per_game = 100,
+        start_dt=cfg_sim.start_dt, end_dt=cfg_sim.end_dt,
+        val_start_dt=cfg_sim.val_start_dt, test_start_dt=cfg_sim.test_start_dt,
+        cache_dir=cfg_sim.cache_dir, max_seq_len=cfg_model.max_seq_len,
+        min_pitches_per_game=100,
     )
     train_ds, val_ds, test_ds, encoders = builder.build()
     _load_re24_table(cfg_sim.cache_dir)
     _load_in_play_probs(cfg_sim.cache_dir)
-    dataset: PitchSequenceDataset = {"train": train_ds, "val": val_ds,
-                                      "test": test_ds}[cfg_sim.split]
 
+    dataset: PitchSequenceDataset = {
+        "train": train_ds, "val": val_ds, "test": test_ds
+    }[cfg_sim.split]
     print(f"[mh-sim] {len(dataset)} games, split={cfg_sim.split}")
-    results = []
 
+    results = []
     for game_idx in range(len(dataset)):
         sample  = dataset[game_idx]
         game_pk = sample["game_pk"].item()
@@ -1179,53 +1318,46 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
 
         with torch.no_grad():
             context_memory = model.encode_context(ctx_batch)
-        ctx_vec_1 = context_memory[:, ctx_out_idx, :]  # [1, d_model]
+        ctx_vec_1 = context_memory[:, ctx_out_idx, :]
 
         context_state = _reconstruct_game_state(game_df, context_end_idx)
 
-        # ── Draw initial trajectory (burn-in seed) ────────────────────────
         current_traj = _simulate_one_game(
             model, encoders, dataset.pitch_scaler, dataset.batter_scaler,
             ctx_vec_1.expand(1, -1), context_state,
             sample["batting_order"].tolist(), device, cfg_sim.max_game_pitches,
+            temperature=cfg_sim.temperature,
         )
 
-        win_votes     = 0
-        n_accepted    = 0
+        win_votes = 0
+        n_accepted = 0
         post_burn_count = 0
 
         for step in range(n_steps + burn_in):
-            # ── Propose: pick random half-inning boundary ─────────────────
             boundaries = current_traj["half_inning_boundaries"]
             m_tau      = len(boundaries)
             if m_tau == 0:
-                # No valid split — accept current as-is
                 proposed_traj = current_traj
                 accepted      = True
             else:
                 split_idx  = random.randint(0, m_tau - 1)
                 split_info = boundaries[split_idx]
-
-                # Rebuild context vector at split point
                 split_ctx_vec = _get_context_at_boundary(
                     model, sample, ctx_vec_1, split_info, device,
                     dataset.pitch_scaler, dataset.batter_scaler, encoders,
                     context_end_idx, cfg_sim.max_game_pitches,
                 )
                 split_gs = split_info["game_state"]
-
                 proposed_traj = _simulate_one_game(
                     model, encoders, dataset.pitch_scaler, dataset.batter_scaler,
                     split_ctx_vec.expand(1, -1), split_gs,
                     sample["batting_order"].tolist(), device, cfg_sim.max_game_pitches,
-                    prefix_phi_sum = split_info["prefix_phi_sum"],
+                    prefix_phi_sum=split_info["prefix_phi_sum"],
+                    temperature=cfg_sim.temperature,
                 )
-
                 m_tau_prime = len(proposed_traj["half_inning_boundaries"])
 
-                # ── Acceptance ratio (eq. 3) ──────────────────────────────
                 if lam == 0.0:
-                    # λ=0 → always accept (pure Monte Carlo)
                     log_alpha = 0.0
                 else:
                     suffix_phi_current  = current_traj["total_phi"] - split_info["prefix_phi_sum"]
@@ -1238,7 +1370,6 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
                     current_traj = proposed_traj
                     n_accepted  += 1
 
-            # ── Post-burn-in collection ───────────────────────────────────
             if step >= burn_in:
                 post_burn_count += 1
                 if current_traj["home_score"] > current_traj["away_score"]:
@@ -1248,19 +1379,15 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
         accept_rate   = n_accepted / max(n_steps, 1)
 
         result = SimResult(
-            game_pk           = game_pk,
-            context_innings   = cfg_sim.context_innings,
-            n_simulations     = post_burn_count,
-            home_win_prob     = home_win_prob,
-            away_win_prob     = 1.0 - home_win_prob,
-            tie_prob          = 0.0,
-            mean_home_runs    = float(current_traj["home_score"]),
-            mean_away_runs    = float(current_traj["away_score"]),
-            std_home_runs     = 0.0,
-            std_away_runs     = 0.0,
-            actual_home_score = actual_home,
-            actual_away_score = actual_away,
-            actual_home_win   = actual_home > actual_away,
+            game_pk=game_pk, context_innings=cfg_sim.context_innings,
+            n_simulations=post_burn_count,
+            home_win_prob=home_win_prob, away_win_prob=1.0 - home_win_prob,
+            tie_prob=0.0,
+            mean_home_runs=float(current_traj["home_score"]),
+            mean_away_runs=float(current_traj["away_score"]),
+            std_home_runs=0.0, std_away_runs=0.0,
+            actual_home_score=actual_home, actual_away_score=actual_away,
+            actual_home_win=actual_home > actual_away,
         )
         results.append(result)
 
@@ -1270,8 +1397,7 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
                 or (not result.actual_home_win and result.away_win_prob > 0.5)
             )
             print(f"  [{game_idx+1:4d}/{len(dataset)}] game={game_pk}  "
-                  f"P(home)={home_win_prob:.3f}  "
-                  f"accept={accept_rate:.2f}  "
+                  f"P(home)={home_win_prob:.3f}  accept={accept_rate:.2f}  "
                   f"{'✓' if correct else '✗'}")
 
     tag      = f"mh_lam{lam}_s{n_steps}_b{burn_in}"
@@ -1285,51 +1411,43 @@ def simulate_games_mh(cfg_sim: SimConfig, cfg_model: ModelConfig,
 
 def _simulate_one_game(
     model, encoders, pitch_scaler, batter_scaler,
-    ctx_vec_1: torch.Tensor,  # [1, d_model]
+    ctx_vec_1: torch.Tensor,
     start_gs: GameState,
     batting_order_raw: List[int],
     device: torch.device,
     max_pitches: int,
     prefix_phi_sum: float = 0.0,
+    temperature: float = 0.85,
 ) -> Dict:
-    """
-    Simulate one complete game suffix from start_gs.
-    Returns a dict with scores, half_inning_boundaries (for MH splitting),
-    and total_phi (sum of φ(s) over all PA states).
-    """
-    pt_idx2str = {v: k for k, v in encoders.pitch_type.items()}
     oc_idx2str = {v: k for k, v in encoders.outcome.items()}
 
     gs          = _clone_game_state(start_gs)
-    current_ctx = ctx_vec_1.squeeze(0).clone()  # [d_model]
+    current_ctx = ctx_vec_1.squeeze(0).clone()
 
     half_inning_boundaries = []
     total_phi              = prefix_phi_sum
     pitch_count            = 0
-
-    # Track current half-inning's φ sum for boundary recording
-    hi_phi_sum = 0.0
+    hi_phi_sum             = 0.0
 
     while not gs.is_game_over() and pitch_count < max_pitches:
-        ctx_active = current_ctx.unsqueeze(0)  # [1, d_model]
+        ctx_active = current_ctx.unsqueeze(0)
 
-        pt_probs   = model.predict_next_pitch_type(ctx_active)
-        pt_sample  = torch.multinomial(pt_probs, 1).squeeze(-1)
+        pt_probs  = model.predict_next_pitch_type(ctx_active, temperature=temperature)
+        pt_sample = torch.multinomial(pt_probs, 1).squeeze(-1)
 
         pitch_feat = model.sample_pitch_features(ctx_active, pt_sample, ddim_steps=10)
 
-        oc_probs   = model.predict_next_outcome(ctx_active)
-        oc_sample  = torch.multinomial(oc_probs, 1).squeeze(-1)
+        oc_probs  = model.predict_next_outcome(ctx_active, temperature=temperature)
+        oc_sample = torch.multinomial(oc_probs, 1).squeeze(-1)
 
         oc = oc_idx2str.get(oc_sample.item(), "ball")
 
-        # φ(s) before this pitch
-        phi_s = _phi(gs.outs, gs.on_1b, gs.on_2b, gs.on_3b)
+        phi_s       = _phi(gs.outs, gs.on_1b, gs.on_2b, gs.on_3b)
         hi_phi_sum += phi_s
         total_phi  += phi_s
 
-        prev_inning  = gs.inning
-        prev_is_top  = gs.is_top
+        prev_inning = gs.inning
+        prev_is_top = gs.is_top
 
         terminal_event = gs.apply_pitch_outcome(oc)
         if oc in IN_PLAY_OUTCOMES:
@@ -1337,9 +1455,7 @@ def _simulate_one_game(
         if terminal_event is not None:
             gs.apply_event(terminal_event)
 
-        # Detect half-inning boundary (inning changed or side changed)
         if gs.inning != prev_inning or gs.is_top != prev_is_top:
-            # Record this boundary for MH splitting
             half_inning_boundaries.append({
                 "pitch_idx":      pitch_count,
                 "game_state":     _clone_game_state(gs),
@@ -1349,37 +1465,31 @@ def _simulate_one_game(
             })
             hi_phi_sum = 0.0
 
-        # Walk-off check
         if gs._check_walkoff():
             break
 
-        # Update context
-        gs_feats = torch.tensor(gs.to_feature_vec(pitch_scaler),
-                                device=device, dtype=torch.float32)
-        batter_tok = batting_order_raw[gs.batting_idx]             if gs.batting_idx < len(batting_order_raw) else 0
-        b_ctx = torch.tensor(
+        gs_feats   = torch.tensor(gs.to_feature_vec(pitch_scaler), device=device, dtype=torch.float32)
+        batter_tok = batting_order_raw[gs.batting_idx] if gs.batting_idx < len(batting_order_raw) else 0
+        b_ctx      = torch.tensor(
             batter_scaler.transform_row({}, BATTER_STAT_COLS),
             device=device, dtype=torch.float32,
         )
         new_ctx = _incremental_encode_step(
-            model       = model,
-            prev_ctx    = current_ctx.unsqueeze(0),
-            pitch_feats = pitch_feat,
-            gs_feats    = gs_feats.unsqueeze(0),
-            b_ctx       = b_ctx.unsqueeze(0),
-            batter_id   = torch.tensor([batter_tok], device=device),
-            pt_token    = pt_sample.unsqueeze(0),
-            oc_token    = oc_sample.unsqueeze(0),
+            model=model, prev_ctx=current_ctx.unsqueeze(0),
+            pitch_feats=pitch_feat, gs_feats=gs_feats.unsqueeze(0),
+            b_ctx=b_ctx.unsqueeze(0),
+            batter_id=torch.tensor([batter_tok], device=device),
+            pt_token=pt_sample.unsqueeze(0), oc_token=oc_sample.unsqueeze(0),
         )
         current_ctx = new_ctx.squeeze(0)
         pitch_count += 1
 
     return {
-        "home_score":              gs.home_score,
-        "away_score":              gs.away_score,
-        "half_inning_boundaries":  half_inning_boundaries,
-        "total_phi":               total_phi,
-        "pitch_count":             pitch_count,
+        "home_score":             gs.home_score,
+        "away_score":             gs.away_score,
+        "half_inning_boundaries": half_inning_boundaries,
+        "total_phi":              total_phi,
+        "pitch_count":            pitch_count,
     }
 
 
@@ -1387,8 +1497,7 @@ def _get_context_at_boundary(
     model, sample, initial_ctx_vec, boundary_info, device,
     pitch_scaler, batter_scaler, encoders, context_end_idx, max_pitches,
 ) -> torch.Tensor:
-    """Return the context vector stored at a half-inning boundary."""
-    return boundary_info["ctx_vec"].unsqueeze(0)  # [1, d_model]
+    return boundary_info["ctx_vec"].unsqueeze(0)
 
 
 def simulate_games(cfg_sim: SimConfig, cfg_model: ModelConfig):
@@ -1396,7 +1505,6 @@ def simulate_games(cfg_sim: SimConfig, cfg_model: ModelConfig):
     out_dir = Path(cfg_sim.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load checkpoint and restore model config
     ckpt      = torch.load(cfg_sim.checkpoint, map_location=device)
     saved_cfg = ckpt.get("cfg_model", {})
     for k, v in saved_cfg.items():
@@ -1409,27 +1517,24 @@ def simulate_games(cfg_sim: SimConfig, cfg_model: ModelConfig):
     print(f"[sim] Loaded checkpoint from {cfg_sim.checkpoint}  "
           f"(epoch {ckpt.get('epoch','?')})")
 
-    # Build dataset with the same dates used for simulation
     builder = BaseballDatasetBuilder(
-        start_dt             = cfg_sim.start_dt,
-        end_dt               = cfg_sim.end_dt,
-        val_start_dt         = cfg_sim.val_start_dt,
-        test_start_dt        = cfg_sim.test_start_dt,
-        cache_dir            = cfg_sim.cache_dir,
-        max_seq_len          = cfg_model.max_seq_len,
-        min_pitches_per_game = 100,
+        start_dt=cfg_sim.start_dt, end_dt=cfg_sim.end_dt,
+        val_start_dt=cfg_sim.val_start_dt, test_start_dt=cfg_sim.test_start_dt,
+        cache_dir=cfg_sim.cache_dir, max_seq_len=cfg_model.max_seq_len,
+        min_pitches_per_game=100,
     )
     train_ds, val_ds, test_ds, encoders = builder.build()
     _load_in_play_probs(cfg_sim.cache_dir)
 
-    dataset: PitchSequenceDataset = {"train": train_ds, "val": val_ds,
-                                      "test": test_ds}[cfg_sim.split]
+    dataset: PitchSequenceDataset = {
+        "train": train_ds, "val": val_ds, "test": test_ds
+    }[cfg_sim.split]
     print(f"[sim] Simulating {len(dataset)} games from '{cfg_sim.split}' split")
     print(f"[sim] Context: {cfg_sim.context_innings} innings  |  "
-          f"N simulations: {cfg_sim.n_simulations}")
+          f"N simulations: {cfg_sim.n_simulations}  |  "
+          f"Temperature: {cfg_sim.temperature}")
 
     results = []
-
     for game_idx in range(len(dataset)):
         sample  = dataset[game_idx]
         game_pk = sample["game_pk"].item()
@@ -1449,48 +1554,38 @@ def simulate_games(cfg_sim: SimConfig, cfg_model: ModelConfig):
             ctx_out_idx     = context_end_idx - 1
 
         with torch.no_grad():
-            context_memory = model.encode_context(ctx_batch)  # [1, T_ctx, d_model]
+            context_memory = model.encode_context(ctx_batch)
 
         context_state = _reconstruct_game_state(game_df, context_end_idx)
-
         K       = cfg_sim.n_simulations
         ctx_vec = context_memory[:, ctx_out_idx, :].expand(K, -1)
 
         h_scores, a_scores = _run_parallel_simulations(
-            model               = model,
-            encoders            = encoders,
-            pitch_scaler        = dataset.pitch_scaler,
-            batter_scaler       = dataset.batter_scaler,
-            pitcher_scaler      = dataset.pitcher_scaler,
-            ctx_vec             = ctx_vec,
-            game_state_template = context_state,
-            sample              = sample,
-            game_df             = game_df,
-            context_end_idx     = context_end_idx,
-            K                   = K,
-            device              = device,
-            max_pitches         = cfg_sim.max_game_pitches,
-            cfg_model           = cfg_model,
+            model=model, encoders=encoders,
+            pitch_scaler=dataset.pitch_scaler,
+            batter_scaler=dataset.batter_scaler,
+            pitcher_scaler=dataset.pitcher_scaler,
+            ctx_vec=ctx_vec, game_state_template=context_state,
+            sample=sample, game_df=game_df,
+            context_end_idx=context_end_idx,
+            K=K, device=device, max_pitches=cfg_sim.max_game_pitches,
+            cfg_model=cfg_model, temperature=cfg_sim.temperature,
         )
 
         home_wins = sum(h > a for h, a in zip(h_scores, a_scores))
         away_wins = sum(a > h for h, a in zip(h_scores, a_scores))
-        # ties = 0 by construction (extra innings play until winner)
 
         result = SimResult(
-            game_pk           = game_pk,
-            context_innings   = cfg_sim.context_innings,
-            n_simulations     = K,
-            home_win_prob     = home_wins / K,
-            away_win_prob     = away_wins / K,
-            tie_prob          = 0.0,
-            mean_home_runs    = float(np.mean(h_scores)),
-            mean_away_runs    = float(np.mean(a_scores)),
-            std_home_runs     = float(np.std(h_scores)),
-            std_away_runs     = float(np.std(a_scores)),
-            actual_home_score = actual_home,
-            actual_away_score = actual_away,
-            actual_home_win   = actual_home > actual_away,
+            game_pk=game_pk, context_innings=cfg_sim.context_innings,
+            n_simulations=K,
+            home_win_prob=home_wins / K, away_win_prob=away_wins / K,
+            tie_prob=0.0,
+            mean_home_runs=float(np.mean(h_scores)),
+            mean_away_runs=float(np.mean(a_scores)),
+            std_home_runs=float(np.std(h_scores)),
+            std_away_runs=float(np.std(a_scores)),
+            actual_home_score=actual_home, actual_away_score=actual_away,
+            actual_home_win=actual_home > actual_away,
         )
         results.append(result)
 
@@ -1508,50 +1603,38 @@ def simulate_games(cfg_sim: SimConfig, cfg_model: ModelConfig):
     with open(out_path, "w") as f:
         json.dump([vars(r) for r in results], f, indent=2)
     print(f"[sim] Saved {len(results)} results to {out_path}")
-
     _print_summary(results)
     return results
 
 
 # ---------------------------------------------------------------------------
-# Vectorized game-state arrays — replace K Python GameState objects with
-# NumPy arrays so all state transitions are O(1) NumPy ops, not O(K) Python.
+# Vectorized simulation helpers
 # ---------------------------------------------------------------------------
 
-# In-play event lookup — vectorized sampling via cumulative probability
-_IN_PLAY_EVENTS_ARR  = np.array([
-    "single","double","triple","home_run",
-    "field_out","force_out","double_play","grounded_into_double_play",
-    "field_error","sac_fly",
+_IN_PLAY_EVENTS_ARR = np.array([
+    "single", "double", "triple", "home_run",
+    "field_out", "force_out", "double_play", "grounded_into_double_play",
+    "field_error", "sac_fly",
 ])
-_IN_PLAY_PROBS_ARR = np.array([0.230, 0.060, 0.008, 0.040,
-                                0.450, 0.080, 0.040, 0.030,
-                                0.010, 0.005])
+_IN_PLAY_PROBS_ARR = np.array([
+    0.2106, 0.0654, 0.0056, 0.0460,
+    0.5926, 0.0298, 0.0031, 0.0274,
+    0.0096, 0.0098,
+])
 _IN_PLAY_PROBS_ARR = _IN_PLAY_PROBS_ARR / _IN_PLAY_PROBS_ARR.sum()
-_IN_PLAY_CUMPROBS   = np.cumsum(_IN_PLAY_PROBS_ARR)
+_IN_PLAY_CUMPROBS  = np.cumsum(_IN_PLAY_PROBS_ARR)
 
 
 def _load_in_play_probs(cache_dir: str) -> None:
-    """Load empirical in-play event distribution; updates module-level arrays.
-
-    Priority:
-      1. {cache_dir}/in_play_probs.json  — computed from the training split
-      2. data/fallback_in_play_probs.json — MLB Statcast 2023 committed to repo
-      3. Hard-coded round-number prior    — last resort
-    """
     global _IN_PLAY_PROBS_ARR, _IN_PLAY_CUMPROBS
-
-    # Candidate paths in priority order
     candidates = [
         Path(cache_dir) / "in_play_probs.json",
         Path(__file__).parent / "data" / "fallback_in_play_probs.json",
     ]
-
     for path in candidates:
         if path.exists():
             with open(path) as f:
                 probs_dict = json.load(f)
-            # Skip metadata keys (prefixed with "_")
             probs = np.array(
                 [probs_dict.get(e, 0.0) for e in _IN_PLAY_EVENTS_ARR], dtype=float
             )
@@ -1562,86 +1645,55 @@ def _load_in_play_probs(cache_dir: str) -> None:
             _IN_PLAY_CUMPROBS  = np.cumsum(_IN_PLAY_PROBS_ARR)
             print(f"[in-play] Loaded in-play probs from {path}")
             return
+    warnings.warn("[in-play] No in_play_probs.json found; using empirical fallback.")
 
-    warnings.warn("[in-play] No in_play_probs.json found; using hard-coded fallback prior.")
 
 def _vec_sample_in_play(n: int) -> np.ndarray:
-    """Sample n in-play events vectorized."""
-    u = np.random.rand(n)
+    u    = np.random.rand(n)
     idxs = np.searchsorted(_IN_PLAY_CUMPROBS, u)
     idxs = np.clip(idxs, 0, len(_IN_PLAY_EVENTS_ARR) - 1)
     return _IN_PLAY_EVENTS_ARR[idxs]
+
+
+def _sample_in_play_event() -> str:
+    return _vec_sample_in_play(1)[0]
 
 
 def _run_parallel_simulations(
     model, encoders, pitch_scaler, batter_scaler, pitcher_scaler,
     ctx_vec, game_state_template, sample, game_df, context_end_idx,
     K, device, max_pitches, cfg_model,
+    temperature: float = 0.85,
 ) -> Tuple[List[float], List[float]]:
-    """
-    Vectorized K-way parallel simulation.
-
-    All game-state transitions are NumPy array operations — no Python loop
-    over K simulations per pitch step. The only per-step Python work is the
-    batched GPU forward pass (model inference) which was already vectorized.
-
-    State arrays  [K]:
-        inning, is_top, outs, balls, strikes
-        on_1b, on_2b, on_3b
-        home_score, away_score
-        batting_idx
-        active_mask, walkoff_mask
-    """
     gs0               = game_state_template
     batting_order_arr = np.array(sample["batting_order"].tolist(), dtype=np.int64)
     n_batters         = len(batting_order_arr)
 
-    # ── Encode outcome/pitch-type index → category string (numpy arrays) ──
-    oc_idx2str  = {v: k for k, v in encoders.outcome.items()}
-    NUM_OC      = len(oc_idx2str)
+    oc_idx2str = {v: k for k, v in encoders.outcome.items()}
 
-    # Build lookup tables: outcome_idx → flags (ball/strike/foul/in_play/terminal)
-    # We encode each outcome as an integer category for vectorized dispatch.
     OC_BALL    = 0
     OC_STRIKE  = 1
     OC_FOUL    = 2
     OC_IN_PLAY = 3
-    OC_OTHER   = 4   # hit_by_pitch, automatic_*, etc. → treated as ball
+    OC_OTHER   = 4
 
     def _classify_outcome(oc_str: str) -> int:
-        if oc_str in BALL_OUTCOMES or oc_str in {"hit_by_pitch",
-                "automatic_ball","bunt_foul_tip","foul_pitchout",
-                "pitchout","intent_ball","blocked_ball"}:
+        if oc_str in BALL_OUTCOMES or oc_str in {
+            "hit_by_pitch", "automatic_ball", "bunt_foul_tip",
+            "foul_pitchout", "pitchout", "intent_ball", "blocked_ball"
+        }:
             return OC_BALL
-        if oc_str in STRIKE_OUTCOMES:
-            return OC_STRIKE
-        if oc_str in FOUL_OUTCOMES:
-            return OC_FOUL
-        if oc_str in IN_PLAY_OUTCOMES:
-            return OC_IN_PLAY
+        if oc_str in STRIKE_OUTCOMES:  return OC_STRIKE
+        if oc_str in FOUL_OUTCOMES:    return OC_FOUL
+        if oc_str in IN_PLAY_OUTCOMES: return OC_IN_PLAY
         return OC_OTHER
 
-    # oc_class[i] = class of outcome token i
-    oc_class = np.array([_classify_outcome(oc_idx2str.get(i, "ball"))
-                          for i in range(max(oc_idx2str.keys()) + 1)],
-                         dtype=np.int32)
+    oc_class = np.array(
+        [_classify_outcome(oc_idx2str.get(i, "ball"))
+         for i in range(max(oc_idx2str.keys()) + 1)],
+        dtype=np.int32,
+    )
 
-    # Vectorized in-play event → (outs_added, base_runs, code_int)
-    # code_int: 0=out, 1=single, 2=double, 3=triple, 4=hr, 5=walk
-    EVENT_CODE_MAP = {
-        "field_out":0,"strikeout":0,"strikeout_double_play":0,
-        "double_play":0,"grounded_into_double_play":0,"force_out":0,
-        "fielders_choice_out":0,"sac_bunt":0,"other_out":0,
-        "field_error":1,"fielders_choice":1,"single":1,
-        "double":2,"triple":3,"home_run":4,
-        "walk":5,"intent_walk":5,"hit_by_pitch":5,"catcher_interf":5,
-        "sac_fly":0,  # outs_added=1, handled separately
-        "sac_fly_double_play":0,
-    }
-    EVENT_OUTS_MAP = {k: v[0] for k, v in EVENT_TABLE.items()}
-    EVENT_RUNS_MAP = {k: v[1] for k, v in EVENT_TABLE.items()}
-
-    # ── Initialize state arrays ────────────────────────────────────────────
     inning      = np.full(K, gs0.inning,      dtype=np.int32)
     is_top      = np.full(K, gs0.is_top,      dtype=bool)
     outs        = np.full(K, gs0.outs,        dtype=np.int32)
@@ -1654,29 +1706,23 @@ def _run_parallel_simulations(
     away_score  = np.full(K, gs0.away_score,  dtype=np.int32)
     batting_idx = np.full(K, gs0.batting_idx, dtype=np.int32)
 
-    active_mask  = np.ones(K, dtype=bool)   # still simulating
-    walkoff_mask = np.zeros(K, dtype=bool)  # walk-off occurred
+    active_mask  = np.ones(K, dtype=bool)
+    walkoff_mask = np.zeros(K, dtype=bool)
+    current_ctx  = ctx_vec.clone()
+    pitch_count  = 0
 
-    current_ctx = ctx_vec.clone()  # [K, d_model]
-    pitch_count = 0
-
-    # Precompute zero batter context (used when batter stats missing)
     zero_b_ctx = torch.tensor(
         batter_scaler.transform_row({}, BATTER_STAT_COLS),
         dtype=torch.float32, device=device,
-    )  # [F_batter]
+    )
 
-    # Precompute GAME_STATE_COLS scaler parameters for vectorized transform
-    gs_cols  = GAME_STATE_COLS
-    gs_mean  = np.array([pitch_scaler.mean_.get(c, 0.0) for c in gs_cols], dtype=np.float32)
-    gs_std   = np.array([pitch_scaler.std_.get(c, 1.0)  for c in gs_cols], dtype=np.float32)
-    gs_std   = np.where(gs_std < 1e-6, 1.0, gs_std)
-
-    # Column indices in gs_cols
-    _ci = {c: i for i, c in enumerate(gs_cols)}
+    gs_cols = GAME_STATE_COLS
+    gs_mean = np.array([pitch_scaler.mean_.get(c, 0.0) for c in gs_cols], dtype=np.float32)
+    gs_std  = np.array([pitch_scaler.std_.get(c, 1.0)  for c in gs_cols], dtype=np.float32)
+    gs_std  = np.where(gs_std < 1e-6, 1.0, gs_std)
+    _ci     = {c: i for i, c in enumerate(gs_cols)}
 
     def _build_gs_feats_batch(active: np.ndarray) -> torch.Tensor:
-        """Build [|active|, F_gs] game-state feature tensor — fully vectorized."""
         n   = len(active)
         raw = np.zeros((n, len(gs_cols)), dtype=np.float32)
         raw[:, _ci["balls"]]        = balls[active]
@@ -1692,115 +1738,79 @@ def _run_parallel_simulations(
         return torch.tensor((raw - gs_mean) / gs_std, dtype=torch.float32, device=device)
 
     while np.any(active_mask) and pitch_count < max_pitches:
-        active = np.where(active_mask)[0]  # indices of still-active sims
+        active = np.where(active_mask)[0]
         n_act  = len(active)
 
-        # ── GPU: batch model forward for all active sims ──────────────────
-        ctx_active  = current_ctx[active]                               # [n_act, d]
-        pt_probs    = model.predict_next_pitch_type(ctx_active)         # [n_act, V_pt]
-        pt_samples  = torch.multinomial(pt_probs, 1).squeeze(-1)       # [n_act]
-        pitch_feats = model.sample_pitch_features(                      # [n_act, F_cont]
-            ctx_active, pt_samples, ddim_steps=10)
-        oc_probs    = model.predict_next_outcome(ctx_active)            # [n_act, V_oc]
-        oc_samples  = torch.multinomial(oc_probs, 1).squeeze(-1)       # [n_act]
+        ctx_active  = current_ctx[active]
+        pt_probs    = model.predict_next_pitch_type(ctx_active, temperature=temperature)
+        pt_samples  = torch.multinomial(pt_probs, 1).squeeze(-1)
+        pitch_feats = model.sample_pitch_features(ctx_active, pt_samples, ddim_steps=10)
+        oc_probs    = model.predict_next_outcome(ctx_active, temperature=temperature)
+        oc_samples  = torch.multinomial(oc_probs, 1).squeeze(-1)
+        oc_np       = oc_samples.cpu().numpy()
 
-        oc_np = oc_samples.cpu().numpy()   # [n_act]  outcome token indices
-
-        # ── Classify outcomes vectorized ──────────────────────────────────
         oc_np_clipped = np.clip(oc_np, 0, len(oc_class) - 1)
-        cls           = oc_class[oc_np_clipped]  # [n_act] OC_BALL/STRIKE/FOUL/IN_PLAY
+        cls           = oc_class[oc_np_clipped]
 
         is_ball    = cls == OC_BALL
         is_strike  = cls == OC_STRIKE
         is_foul    = cls == OC_FOUL
         is_in_play = cls == OC_IN_PLAY
 
-        # ── Count updates ─────────────────────────────────────────────────
         balls[active]   += is_ball.astype(np.int32)
         strikes[active] += is_strike.astype(np.int32)
-        # Foul: only add strike if < 2 strikes
-        foul_adds = is_foul & (strikes[active] < 2)
+        foul_adds        = is_foul & (strikes[active] < 2)
         strikes[active] += foul_adds.astype(np.int32)
 
-        # ── Terminal pitch outcomes ────────────────────────────────────────
-        walk_from_ball    = is_ball    & (balls[active]   >= 4)
-        ko_from_strike    = is_strike  & (strikes[active] >= 3)
+        walk_from_ball = is_ball   & (balls[active]   >= 4)
+        ko_from_strike = is_strike & (strikes[active] >= 3)
 
-        # For in-play: sample events vectorized
-        n_in_play       = int(is_in_play.sum())
-        in_play_events  = _vec_sample_in_play(n_in_play) if n_in_play > 0 else np.array([])
-        in_play_ptr     = 0
+        n_in_play      = int(is_in_play.sum())
+        in_play_events = _vec_sample_in_play(n_in_play) if n_in_play > 0 else np.array([])
+        in_play_ptr    = 0
 
-        # Process each active sim — we still loop but only for the event
-        # application logic which has complex branching; the count updates
-        # above are already vectorized. This loop is now much shorter.
         for local_i in range(n_act):
             sim_i = active[local_i]
-
             if walk_from_ball[local_i]:
                 _vec_apply_walk(sim_i, inning, is_top, home_score, away_score,
                                 on_1b, on_2b, on_3b, walkoff_mask)
-                balls[sim_i]   = 0
-                strikes[sim_i] = 0
+                balls[sim_i] = strikes[sim_i] = 0
                 batting_idx[sim_i] = (batting_idx[sim_i] + 1) % 9
-
             elif ko_from_strike[local_i]:
                 outs[sim_i] += 1
-                balls[sim_i]   = 0
-                strikes[sim_i] = 0
+                balls[sim_i] = strikes[sim_i] = 0
                 batting_idx[sim_i] = (batting_idx[sim_i] + 1) % 9
                 if outs[sim_i] >= 3:
                     _vec_end_half_inning(sim_i, inning, is_top, outs,
                                          on_1b, on_2b, on_3b, balls, strikes)
-
             elif is_in_play[local_i]:
                 ev = in_play_events[in_play_ptr]; in_play_ptr += 1
                 _vec_apply_event(sim_i, ev, inning, is_top, outs,
-                                  on_1b, on_2b, on_3b,
-                                  home_score, away_score,
+                                  on_1b, on_2b, on_3b, home_score, away_score,
                                   balls, strikes, batting_idx, walkoff_mask)
-            # balls/strikes/fouls with no terminal: already handled above
 
-        # ── Rebuild game-state features for context update (vectorized) ───
-        gs_feats = _build_gs_feats_batch(active)  # [n_act, F_gs]
-
-        # Batter IDs for active sims
-        b_idxs     = batting_idx[active] % n_batters
+        gs_feats    = _build_gs_feats_batch(active)
+        b_idxs      = batting_idx[active] % n_batters
         batter_toks = torch.tensor(
-            [batting_order_arr[b] for b in b_idxs],
-            dtype=torch.long, device=device,
-        )  # [n_act]
+            [batting_order_arr[b] for b in b_idxs], dtype=torch.long, device=device
+        )
+        b_ctx_batch = zero_b_ctx.unsqueeze(0).expand(n_act, -1)
 
-        # All active sims share the same zero batter context (no per-pitch stats)
-        b_ctx_batch = zero_b_ctx.unsqueeze(0).expand(n_act, -1)  # [n_act, F_bat]
-
-        # ── Vectorized context update (single batched call) ───────────────
         new_ctxs = _incremental_encode_step_batch(
-            model       = model,
-            prev_ctx    = ctx_active,           # [n_act, d]
-            pitch_feats = pitch_feats,          # [n_act, F_cont]
-            gs_feats    = gs_feats,             # [n_act, F_gs]
-            b_ctx       = b_ctx_batch,          # [n_act, F_bat]
-            batter_ids  = batter_toks,          # [n_act]
-            pt_tokens   = pt_samples,           # [n_act]
-            oc_tokens   = oc_samples,           # [n_act]
-        )  # [n_act, d]
-
-        # Write updated contexts back
+            model=model, prev_ctx=ctx_active,
+            pitch_feats=pitch_feats, gs_feats=gs_feats,
+            b_ctx=b_ctx_batch, batter_ids=batter_toks,
+            pt_tokens=pt_samples, oc_tokens=oc_samples,
+        )
         current_ctx[active] = new_ctxs
 
-        # ── Update active mask ─────────────────────────────────────────────
-        # Game over: inning > 9 AND is_top (just flipped) AND scores differ
-        game_over = (
-            (inning > 9) & is_top & (home_score != away_score)
-        )
+        game_over   = (inning > 9) & is_top & (home_score != away_score)
         active_mask = ~game_over & ~walkoff_mask
         pitch_count += 1
 
     return home_score.tolist(), away_score.tolist()
 
 
-# ── Vectorized helper: apply walk to one simulation ───────────────────────────
 def _vec_apply_walk(sim_i, inning, is_top, home_score, away_score,
                     on_1b, on_2b, on_3b, walkoff_mask):
     if on_1b[sim_i] and on_2b[sim_i] and on_3b[sim_i]:
@@ -1823,16 +1833,16 @@ def _vec_apply_walk(sim_i, inning, is_top, home_score, away_score,
 
 def _vec_end_half_inning(sim_i, inning, is_top, outs, on_1b, on_2b, on_3b,
                           balls, strikes):
-    outs[sim_i]    = 0
-    on_1b[sim_i]   = on_2b[sim_i] = on_3b[sim_i] = False
-    balls[sim_i]   = strikes[sim_i] = 0
+    outs[sim_i]  = 0
+    on_1b[sim_i] = on_2b[sim_i] = on_3b[sim_i] = False
+    balls[sim_i] = strikes[sim_i] = 0
     if is_top[sim_i]:
         is_top[sim_i] = False
     else:
         inning[sim_i] += 1
         is_top[sim_i]  = True
         if inning[sim_i] > 9:
-            on_2b[sim_i] = True  # automatic runner
+            on_2b[sim_i] = True
 
 
 def _vec_apply_event(sim_i, event_str, inning, is_top, outs,
@@ -1840,14 +1850,12 @@ def _vec_apply_event(sim_i, event_str, inning, is_top, outs,
                       balls, strikes, batting_idx, walkoff_mask):
     outs_added, base_runs, code = EVENT_TABLE.get(event_str, (1, 0, "out"))
     runs = base_runs
-
     if code == "out":
         outs[sim_i] += outs_added
         if outs[sim_i] >= 3:
             _vec_end_half_inning(sim_i, inning, is_top, outs, on_1b, on_2b,
                                   on_3b, balls, strikes)
     else:
-        # Advance runners
         bases = {"single":1,"double":2,"triple":3,"hr":4,"walk":1,"hbp":1}.get(code, 0)
         new_1b = new_2b = new_3b = False
         if bases == 1:
@@ -1869,49 +1877,40 @@ def _vec_apply_event(sim_i, event_str, inning, is_top, outs,
             if on_3b[sim_i]: runs += 1
             if on_2b[sim_i]: runs += 1
             if on_1b[sim_i]: runs += 1
-            runs += 1  # batter scores
+            runs += 1
         on_1b[sim_i], on_2b[sim_i], on_3b[sim_i] = new_1b, new_2b, new_3b
-
         if is_top[sim_i]:
             away_score[sim_i] += runs
         else:
             home_score[sim_i] += runs
             if inning[sim_i] >= 9 and home_score[sim_i] > away_score[sim_i]:
                 walkoff_mask[sim_i] = True
-
         balls[sim_i] = strikes[sim_i] = 0
-
     batting_idx[sim_i] = (batting_idx[sim_i] + 1) % 9
 
 
 def _incremental_encode_step_batch(
     model, prev_ctx, pitch_feats, gs_feats, b_ctx, batter_ids, pt_tokens, oc_tokens,
 ) -> torch.Tensor:
-    """
-    Vectorized context update for a batch of simulations.
-    All inputs are [n_act, *] tensors — one forward pass covers all active sims.
-    """
-    enc    = model.encoder
-    b_emb  = enc.batter_emb(batter_ids)   # [n_act, E]
-    pt_emb = enc.ptype_emb(pt_tokens)     # [n_act, E]
-    oc_emb = enc.outcome_emb(oc_tokens)   # [n_act, E]
-    step_in = torch.cat([pitch_feats, gs_feats, b_ctx, b_emb, pt_emb, oc_emb], dim=-1)
-    new_ctx = enc.step_proj(step_in) + prev_ctx
-    return enc.out_norm(new_ctx)           # [n_act, d_model]
-
-
-def _incremental_encode_step(
-    model, prev_ctx, pitch_feats, gs_feats, b_ctx, batter_id, pt_token, oc_token
-) -> torch.Tensor:
-    """Single-sim context update — used by MH-MCMC path."""
-    enc    = model.encoder
-    b_emb  = enc.batter_emb(batter_id)
-    pt_emb = enc.ptype_emb(pt_token)
-    oc_emb = enc.outcome_emb(oc_token)
+    enc     = model.encoder
+    b_emb   = enc.batter_emb(batter_ids)
+    pt_emb  = enc.ptype_emb(pt_tokens)
+    oc_emb  = enc.outcome_emb(oc_tokens)
     step_in = torch.cat([pitch_feats, gs_feats, b_ctx, b_emb, pt_emb, oc_emb], dim=-1)
     new_ctx = enc.step_proj(step_in) + prev_ctx
     return enc.out_norm(new_ctx)
 
+
+def _incremental_encode_step(
+    model, prev_ctx, pitch_feats, gs_feats, b_ctx, batter_id, pt_token, oc_token,
+) -> torch.Tensor:
+    enc     = model.encoder
+    b_emb   = enc.batter_emb(batter_id)
+    pt_emb  = enc.ptype_emb(pt_token)
+    oc_emb  = enc.outcome_emb(oc_token)
+    step_in = torch.cat([pitch_feats, gs_feats, b_ctx, b_emb, pt_emb, oc_emb], dim=-1)
+    new_ctx = enc.step_proj(step_in) + prev_ctx
+    return enc.out_norm(new_ctx)
 
 
 def _reconstruct_game_state(game_df, context_end_idx: int) -> GameState:
@@ -2001,7 +2000,7 @@ def _print_summary(results: List[SimResult]):
 
 def _resolve_device(device_str: str) -> torch.device:
     if device_str == "auto":
-        if torch.cuda.is_available():       return torch.device("cuda")
+        if torch.cuda.is_available():         return torch.device("cuda")
         if torch.backends.mps.is_available(): return torch.device("mps")
         return torch.device("cpu")
     return torch.device(device_str)
@@ -2020,26 +2019,27 @@ def parse_args():
     parser = argparse.ArgumentParser(description="TransFusion Baseball Model")
     sub    = parser.add_subparsers(dest="command")
 
-    # train
     p_train = sub.add_parser("train")
-    p_train.add_argument("--cache_dir",       default="./baseball_cache")
-    p_train.add_argument("--checkpoint_dir",  default="./checkpoints")
-    p_train.add_argument("--start_dt",        default="2021-04-07")
-    p_train.add_argument("--end_dt",          default="2026-05-01")
-    p_train.add_argument("--val_start_dt",    default="2025-03-20")
-    p_train.add_argument("--test_start_dt",   default="2026-03-25")
-    p_train.add_argument("--epochs",          type=int,   default=40)
-    p_train.add_argument("--batch_size",      type=int,   default=16)
-    p_train.add_argument("--lr",              type=float, default=3e-4)
-    p_train.add_argument("--d_model",         type=int,   default=256)
-    p_train.add_argument("--n_layers",        type=int,   default=6)
-    p_train.add_argument("--n_heads",         type=int,   default=8)
-    p_train.add_argument("--n_diff_steps",    type=int,   default=50)
-    p_train.add_argument("--num_workers",     type=int,   default=4)
-    p_train.add_argument("--device",          default="auto")
-    p_train.add_argument("--seed",            type=int,   default=42)
+    p_train.add_argument("--cache_dir",         default="./baseball_cache")
+    p_train.add_argument("--checkpoint_dir",    default="./checkpoints")
+    p_train.add_argument("--start_dt",          default="2015-03-22")
+    p_train.add_argument("--end_dt",            default="2026-05-01")
+    p_train.add_argument("--val_start_dt",      default="2025-03-20")
+    p_train.add_argument("--test_start_dt",     default="2026-03-25")
+    p_train.add_argument("--epochs",            type=int,   default=60)
+    p_train.add_argument("--batch_size",        type=int,   default=16)
+    p_train.add_argument("--lr",                type=float, default=2e-4)
+    p_train.add_argument("--d_model",           type=int,   default=384)
+    p_train.add_argument("--n_layers",          type=int,   default=10)
+    p_train.add_argument("--n_heads",           type=int,   default=8)
+    p_train.add_argument("--n_diff_steps",      type=int,   default=50)
+    p_train.add_argument("--pitcher_latent_dim",type=int,   default=32)
+    p_train.add_argument("--batter_latent_dim", type=int,   default=32)
+    p_train.add_argument("--lambda_vae",        type=float, default=0.05)
+    p_train.add_argument("--num_workers",       type=int,   default=0)
+    p_train.add_argument("--device",            default="auto")
+    p_train.add_argument("--seed",              type=int,   default=42)
 
-    # simulate
     p_sim = sub.add_parser("simulate")
     p_sim.add_argument("--checkpoint",       required=True)
     p_sim.add_argument("--cache_dir",        default="./baseball_cache")
@@ -2053,62 +2053,50 @@ def parse_args():
                        choices=["train", "val", "test"])
     p_sim.add_argument("--out_dir",          default="./sim_results")
     p_sim.add_argument("--device",           default="auto")
-    p_sim.add_argument("--mh",               action="store_true",
-                       help="Use MH-MCMC instead of plain Monte Carlo.")
-    p_sim.add_argument("--lam",              type=float, default=1.0,
-                       help="RE24 energy weight λ (0=plain MC, >0=MH correction).")
-    p_sim.add_argument("--n_steps",          type=int,   default=500,
-                       help="MH chain steps (post burn-in).")
-    p_sim.add_argument("--burn_in",          type=int,   default=100,
-                       help="MH burn-in steps.")
+    p_sim.add_argument("--mh",               action="store_true")
+    p_sim.add_argument("--lam",              type=float, default=1.0)
+    p_sim.add_argument("--n_steps",          type=int,   default=500)
+    p_sim.add_argument("--burn_in",          type=int,   default=100)
+    p_sim.add_argument("--temperature",      type=float, default=0.85)
 
     return parser.parse_args()
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     args = parse_args()
 
     if args.command == "train":
         cfg_train = TrainConfig(
-            cache_dir      = args.cache_dir,
-            checkpoint_dir = args.checkpoint_dir,
-            start_dt       = args.start_dt,
-            end_dt         = args.end_dt,
-            val_start_dt   = args.val_start_dt,
-            test_start_dt  = args.test_start_dt,
-            epochs         = args.epochs,
-            batch_size     = args.batch_size,
-            lr             = args.lr,
-            num_workers    = args.num_workers,
-            device         = args.device,
-            seed           = args.seed,
+            cache_dir=args.cache_dir, checkpoint_dir=args.checkpoint_dir,
+            start_dt=args.start_dt, end_dt=args.end_dt,
+            val_start_dt=args.val_start_dt, test_start_dt=args.test_start_dt,
+            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+            num_workers=args.num_workers, device=args.device, seed=args.seed,
         )
         cfg_model = ModelConfig(
-            d_model           = args.d_model,
-            n_layers          = args.n_layers,
-            n_heads           = args.n_heads,
-            n_diffusion_steps = args.n_diff_steps,
+            d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
+            n_diffusion_steps=args.n_diff_steps,
+            pitcher_latent_dim=args.pitcher_latent_dim,
+            batter_latent_dim=args.batter_latent_dim,
+            lambda_vae=args.lambda_vae,
         )
         train(cfg_train, cfg_model)
 
     elif args.command == "simulate":
         cfg_sim = SimConfig(
-            checkpoint      = args.checkpoint,
-            cache_dir       = args.cache_dir,
-            start_dt        = args.start_dt,
-            end_dt          = args.end_dt,
-            val_start_dt    = args.val_start_dt,
-            test_start_dt   = args.test_start_dt,
-            context_innings = args.context_innings,
-            n_simulations   = args.n_simulations,
-            split           = args.split,
-            out_dir         = args.out_dir,
-            device          = args.device,
+            checkpoint=args.checkpoint, cache_dir=args.cache_dir,
+            start_dt=args.start_dt, end_dt=args.end_dt,
+            val_start_dt=args.val_start_dt, test_start_dt=args.test_start_dt,
+            context_innings=args.context_innings, n_simulations=args.n_simulations,
+            split=args.split, out_dir=args.out_dir, device=args.device,
+            temperature=args.temperature,
         )
         if args.mh:
             simulate_games_mh(cfg_sim, ModelConfig(),
-                               lam=args.lam,
-                               n_steps=args.n_steps,
+                               lam=args.lam, n_steps=args.n_steps,
                                burn_in=args.burn_in)
         else:
             simulate_games(cfg_sim, ModelConfig())

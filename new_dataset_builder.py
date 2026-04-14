@@ -931,9 +931,9 @@ class BaseballDatasetBuilder:
 
 if __name__ == "__main__":
     builder = BaseballDatasetBuilder(
-        start_dt      = "2021-04-07",
+        start_dt      = "2015-03-22",
         end_dt        = "2026-05-01",
-        val_start_dt  = "2025-03-20",
+        val_start_dt  = "2026-02-20",
         test_start_dt = "2026-03-25",
         cache_dir     = "./baseball_cache",
         max_seq_len   = 400,

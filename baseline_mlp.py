@@ -270,10 +270,11 @@ class BaselineMLP(nn.Module):
 class MLPTrainConfig:
     cache_dir:        str   = "./baseball_cache"
     checkpoint_dir:   str   = "./checkpoints_mlp"
-    start_dt:         str   = "2022-04-07"
-    end_dt:           str   = "2025-11-01"
-    val_start_dt:     str   = "2025-03-27"
-    test_start_dt:    str   = "2025-09-30"
+    start_dt:         str   = "2015-03-22"
+    end_dt:           str   = "2026-05-01"
+    val_start_dt:     str   = "2025-03-20"
+    test_start_dt:    str   = "2026-03-25"
+
     context_innings:  float = 0.0
     epochs:           int   = 100
     batch_size:       int   = 256    # MLP can handle large batches
@@ -867,10 +868,10 @@ def parse_args():
     p_train = sub.add_parser("train")
     p_train.add_argument("--cache_dir",       default="./baseball_cache")
     p_train.add_argument("--checkpoint_dir",  default="./checkpoints_mlp")
-    p_train.add_argument("--start_dt",        default="2022-04-07")
-    p_train.add_argument("--end_dt",          default="2025-11-01")
-    p_train.add_argument("--val_start_dt",    default="2025-03-27")
-    p_train.add_argument("--test_start_dt",   default="2025-09-30")
+    p_train.add_argument("--start_dt",          default="2015-03-22")
+    p_train.add_argument("--end_dt",            default="2026-05-01")
+    p_train.add_argument("--val_start_dt",      default="2025-03-20")
+    p_train.add_argument("--test_start_dt",     default="2026-03-25")
     p_train.add_argument("--context_innings", type=float, default=0.0)
     p_train.add_argument("--epochs",          type=int,   default=100)
     p_train.add_argument("--batch_size",      type=int,   default=256)
@@ -883,10 +884,10 @@ def parse_args():
     p_eval = sub.add_parser("evaluate")
     p_eval.add_argument("--checkpoint",      required=True)
     p_eval.add_argument("--cache_dir",       default="./baseball_cache")
-    p_eval.add_argument("--start_dt",        default="2022-04-07")
-    p_eval.add_argument("--end_dt",          default="2025-11-01")
-    p_eval.add_argument("--val_start_dt",    default="2025-03-27")
-    p_eval.add_argument("--test_start_dt",   default="2025-09-30")
+    p_eval.add_argument("--start_dt",        default="2015-03-22")
+    p_eval.add_argument("--end_dt",          default="2026-05-01")
+    p_eval.add_argument("--val_start_dt",    default="2025-03-20")
+    p_eval.add_argument("--test_start_dt",   default="2026-03-25")
     p_eval.add_argument("--context_innings", type=float, default=0.0)
     p_eval.add_argument("--split",           default="test",
                         choices=["train", "val", "test"])
